@@ -1,0 +1,4 @@
+import { z } from 'zod'
+export const deviceSchema = z.object({ name: z.string().trim().min(1).max(100), deviceId: z.string().trim().min(1).max(100), description: z.string().trim().max(500).optional(), status: z.enum(['online','offline']).optional(), connectionType: z.enum(['wifi','bluetooth','mqtt']), ipAddress: z.string().trim().max(64).optional(), macAddress: z.string().trim().max(64).optional(), firmwareVersion: z.string().trim().max(64).optional() })
+export const deviceUpdateSchema = deviceSchema.partial().omit({ deviceId: true })
+export const deviceConfigSchema = z.object({}).passthrough()
