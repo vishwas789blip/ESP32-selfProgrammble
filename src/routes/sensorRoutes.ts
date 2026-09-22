@@ -4,6 +4,7 @@ import { authMiddleware } from '../middleware/authMiddleware.js'
 import { validate } from '../middleware/validateMiddleware.js'
 import { sensorController } from '../controllers/index.js'
 import { gpioSchema } from '../validations/commonSchemas.js'
+import { asyncHandler } from '../utils/asyncHandler.js'
 
 const sensorSchema = z.object({
   name: z.string().trim().min(1).max(100),
@@ -18,9 +19,9 @@ export const sensorRoutes = Router()
 
 sensorRoutes.use(authMiddleware)
 
-sensorRoutes.get('/devices/:deviceId/sensors', sensorController.list)
-sensorRoutes.post('/devices/:deviceId/sensors', validate(sensorSchema), sensorController.create)
+sensorRoutes.get('/devices/:deviceId/sensors', asyncHandler(sensorController.list))
+sensorRoutes.post('/devices/:deviceId/sensors', validate(sensorSchema), asyncHandler(sensorController.create))
 
-sensorRoutes.get('/sensors/:id', sensorController.get)
-sensorRoutes.put('/sensors/:id', validate(sensorSchema.partial()), sensorController.update)
-sensorRoutes.delete('/sensors/:id', sensorController.remove)
+sensorRoutes.get('/sensors/:id', asyncHandler(sensorController.get))
+sensorRoutes.put('/sensors/:id', validate(sensorSchema.partial()), asyncHandler(sensorController.update))
+sensorRoutes.delete('/sensors/:id', asyncHandler(sensorController.remove))

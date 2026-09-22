@@ -4,7 +4,11 @@ import { Sensor } from '../models/Sensor.js'
 import { Actuator } from '../models/Actuator.js'
 import { devices as deviceService, commandActuator, automations as automationService } from './resourceServices.js'
 
-const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
+// Gemini's generateContent endpoint. See:
+// https://ai.google.dev/api/generate-content#method:-models.generatecontent
+const GEMINI_URL = (model: string) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`
+
 const MAX_TOOL_ROUNDS = 5
 
 function serviceUnavailable(message: string) {
@@ -42,16 +46,20 @@ async function buildContext(userId: string) {
   }))
 }
 
+// Tool definitions, in OpenAPI-schema form (this is the format the
+// Gemini API expects under tools[].functionDeclarations[].parameters —
+// note there is no "additionalProperties" support, so it's left out
+// entirely here rather than stripped at request time).
 const tools = [
   {
     name: 'get_status',
     description: 'Fetch a fresh snapshot of the current user\'s devices, sensors and actuators (latest values/states). Use this whenever you need up-to-date readings before answering.',
-    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+    parameters: { type: 'object', properties: {} },
   },
   {
     name: 'send_command',
     description: 'Send an immediate ON/OFF command to one actuator belonging to the current user, via MQTT.',
-    input_schema: {
+    parameters: {
       type: 'object',
       properties: {
         actuatorId: { type: 'string', description: 'The actuatorId (Mongo ObjectId) from the context/snapshot. Never invent one.' },
@@ -59,13 +67,12 @@ const tools = [
         duration: { type: 'number', description: 'Optional auto-off duration in seconds, for a timed ON command.' },
       },
       required: ['actuatorId', 'command'],
-      additionalProperties: false,
     },
   },
   {
     name: 'create_automation',
     description: 'Create a new automation rule that watches one or more sensors and drives one or more actuators when they match. All conditions must currently be met together (AND) for the actions to fire.',
-    input_schema: {
+    parameters: {
       type: 'object',
       properties: {
         deviceId: { type: 'string', description: 'The deviceId (Mongo ObjectId) the automation belongs to.' },
@@ -97,33 +104,51 @@ const tools = [
         enabled: { type: 'boolean' },
       },
       required: ['deviceId', 'name', 'conditions', 'actions'],
-      additionalProperties: false,
     },
   },
 ]
 
-type AnthropicContentBlock =
-  | { type: 'text'; text: string }
-  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+// ---------------------------------------------------------------------
+// Gemini request/response shapes
+// ---------------------------------------------------------------------
+type GeminiPart =
+  | { text: string }
+  | { functionCall: { name: string; args?: Record<string, unknown> } }
+  | { functionResponse: { name: string; response: Record<string, unknown> } }
 
-async function callClaude(messages: unknown[], systemPrompt: string) {
-  if (!env.ANTHROPIC_API_KEY) {
-    throw serviceUnavailable('AI assistant is not configured: set ANTHROPIC_API_KEY on the backend.')
+type GeminiContent = { role: 'user' | 'model'; parts: GeminiPart[] }
+
+type GeminiResponse = {
+  candidates?: Array<{
+    content?: { role: string; parts: GeminiPart[] }
+    finishReason?: string
+  }>
+  promptFeedback?: { blockReason?: string }
+}
+
+function isFunctionCallPart(p: GeminiPart): p is Extract<GeminiPart, { functionCall: unknown }> {
+  return 'functionCall' in p
+}
+
+function isTextPart(p: GeminiPart): p is Extract<GeminiPart, { text: string }> {
+  return 'text' in p && typeof (p as { text?: unknown }).text === 'string'
+}
+
+async function callGemini(contents: GeminiContent[], systemPrompt: string) {
+  if (!env.GEMINI_API_KEY) {
+    throw serviceUnavailable('AI assistant is not configured: set GEMINI_API_KEY on the backend.')
   }
 
-  const response = await fetch(ANTHROPIC_URL, {
+  const response = await fetch(GEMINI_URL(env.GEMINI_MODEL), {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
+      'x-goog-api-key': env.GEMINI_API_KEY,
     },
     body: JSON.stringify({
-      model: env.ANTHROPIC_MODEL,
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages,
-      tools,
+      contents,
+      system_instruction: { parts: [{ text: systemPrompt }] },
+      tools: [{ function_declarations: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })) }],
     }),
   })
 
@@ -132,7 +157,7 @@ async function callClaude(messages: unknown[], systemPrompt: string) {
     throw serviceUnavailable(`AI provider request failed (${response.status}): ${detail.slice(0, 300)}`)
   }
 
-  return response.json() as Promise<{ content: AnthropicContentBlock[]; stop_reason: string }>
+  return response.json() as Promise<GeminiResponse>
 }
 
 async function runTool(userId: string, name: string, input: Record<string, unknown>) {
@@ -186,33 +211,58 @@ export async function chat(userId: string, message: string): Promise<string> {
     JSON.stringify(context),
   ].join('\n')
 
-  const messages: unknown[] = [{ role: 'user', content: message }]
+  const contents: GeminiContent[] = [{ role: 'user', parts: [{ text: message }] }]
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const result = await callClaude(messages, systemPrompt)
+    const result = await callGemini(contents, systemPrompt)
 
-    const toolUses = result.content.filter((b): b is Extract<AnthropicContentBlock, { type: 'tool_use' }> => b.type === 'tool_use')
-    const text = result.content.filter((b): b is Extract<AnthropicContentBlock, { type: 'text' }> => b.type === 'text').map((b) => b.text).join('\n')
+    if (result.promptFeedback?.blockReason) {
+      throw serviceUnavailable(`AI provider blocked the request: ${result.promptFeedback.blockReason}`)
+    }
 
-    if (toolUses.length === 0) {
+    const candidate = result.candidates?.[0]
+    const parts = candidate?.content?.parts ?? []
+
+    const functionCalls = parts.filter(isFunctionCallPart)
+    const text = parts.filter(isTextPart).map((p) => p.text).join('\n')
+
+    if (functionCalls.length === 0) {
+      // No tool call this round — this IS the model's final answer.
       return text || 'Done.'
     }
 
-    messages.push({ role: 'assistant', content: result.content })
+    // Keep the model's own turn (including its functionCall parts) in
+    // history, exactly as Gemini returned it, so the next round has
+    // the full back-and-forth to reason over.
+    contents.push({ role: 'model', parts })
 
-    const toolResults = await Promise.all(
-      toolUses.map(async (call) => {
+    const functionResponseParts: GeminiPart[] = await Promise.all(
+      functionCalls.map(async (call) => {
         try {
-          const data = await runTool(userId, call.name, call.input)
-          return { type: 'tool_result', tool_use_id: call.id, content: JSON.stringify(data) }
+          const data = await runTool(userId, call.functionCall.name, call.functionCall.args ?? {})
+          return {
+            functionResponse: {
+              name: call.functionCall.name,
+              response: { result: data },
+            },
+          }
         } catch (err) {
           const e = err as { message?: string }
-          return { type: 'tool_result', tool_use_id: call.id, is_error: true, content: e.message ?? 'Tool execution failed' }
+          return {
+            functionResponse: {
+              name: call.functionCall.name,
+              response: { error: e.message ?? 'Tool execution failed' },
+            },
+          }
         }
       }),
     )
 
-    messages.push({ role: 'user', content: toolResults })
+    // Gemini expects function results back as a "user" turn made up of
+    // functionResponse parts (not a "function" role) — this is what
+    // actually drives the model to keep going and produce a final
+    // natural-language reply on the next round.
+    contents.push({ role: 'user', parts: functionResponseParts })
   }
 
   return "I wasn't able to finish that within the allotted number of steps — could you narrow the request down?"

@@ -252,7 +252,11 @@ export async function evaluateAutomations(
     const knownValues = new Map<string, unknown>([[sensorId, currentValue]])
     const missingIds = [...new Set(relevantIds)].filter((id) => !knownValues.has(id))
     if (missingIds.length > 0) {
-      const otherSensors = await Sensor.find({ _id: { $in: missingIds } })
+      // Scoped to this automation's own device: conditions are validated
+      // to reference only sensors on that device when the automation is
+      // created/updated, but this scoping is kept here too as a second
+      // line of defense against ever reading another device's sensor.
+      const otherSensors = await Sensor.find({ _id: { $in: missingIds }, deviceId: device._id })
       for (const s of otherSensors) knownValues.set(String(s._id), s.value)
     }
 

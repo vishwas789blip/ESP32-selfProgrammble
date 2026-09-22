@@ -3,9 +3,10 @@ import { authMiddleware } from '../middleware/authMiddleware.js'
 import { validate } from '../middleware/validateMiddleware.js'
 import { registerSchema, loginSchema } from '../validations/authSchemas.js'
 import { authController } from '../controllers/index.js'
+import { asyncHandler } from '../utils/asyncHandler.js'
 
 export const authRoutes = Router()
 
-authRoutes.post('/register', validate(registerSchema), authController.register)
-authRoutes.post('/login', validate(loginSchema), authController.login)
-authRoutes.get('/me', authMiddleware, authController.me)
+authRoutes.post('/register', validate(registerSchema), asyncHandler(authController.register))
+authRoutes.post('/login', validate(loginSchema), asyncHandler(authController.login))
+authRoutes.get('/me', authMiddleware, asyncHandler(authController.me))

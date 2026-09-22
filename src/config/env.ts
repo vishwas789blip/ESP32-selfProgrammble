@@ -12,7 +12,7 @@ const schema = z.object({
   MQTT_USERNAME: z.string().default(''),
   MQTT_PASSWORD: z.string().default(''),
   MQTT_CLIENT_ID: z.string().min(1).default('esp32-backend'),
-  ANTHROPIC_API_KEY: z.string().min(1).optional(),
-  ANTHROPIC_MODEL: z.string().default('claude-sonnet-4-5'),
+  GEMINI_API_KEY: z.string().min(1),
+  GEMINI_MODEL: z.string().default('gemini-3.6-flash'),
 })
 export const env = schema.parse(process.env)

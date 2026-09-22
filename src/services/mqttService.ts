@@ -127,6 +127,14 @@ export async function pushDeviceConfig(
       Automation.find({ deviceId: deviceMongoId, enabled: true }),
     ])
 
+    // The device identifies actuators by name (it has no database), so
+    // every actuatorId sent to it — both in the actuators list below and
+    // inside each automation's actions — must be the actuator's name,
+    // not its Mongo ObjectId.
+    const actuatorNameById = new Map(
+      actuators.map(actuator => [String(actuator._id), actuator.name]),
+    )
+
     await publishConfig(device.deviceId, {
   deviceId: device.deviceId,
 
@@ -162,7 +170,7 @@ export async function pushDeviceConfig(
   automations: automations
     .filter(automation =>
       automation.conditions.every(c => c.sensorId) &&
-      automation.actions.every(a => a.actuatorId),
+      automation.actions.every(a => a.actuatorId && actuatorNameById.has(String(a.actuatorId))),
     )
     .map(automation => ({
     automationId: String(automation._id),
@@ -176,7 +184,7 @@ export async function pushDeviceConfig(
     })),
 
     actions: automation.actions.map(action => ({
-      actuatorId: String(action.actuatorId),
+      actuatorId: actuatorNameById.get(String(action.actuatorId))!,
       command: String(action.command).trim().toUpperCase() as 'ON' | 'OFF',
       ...(action.duration !== undefined &&
       action.duration !== null

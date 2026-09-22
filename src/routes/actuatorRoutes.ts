@@ -4,6 +4,7 @@ import { authMiddleware } from '../middleware/authMiddleware.js'
 import { validate } from '../middleware/validateMiddleware.js'
 import { actuatorController } from '../controllers/index.js'
 import { gpioSchema } from '../validations/commonSchemas.js'
+import { asyncHandler } from '../utils/asyncHandler.js'
 
 const actuatorSchema = z.object({
   name: z.string().trim().min(1).max(100),
@@ -21,9 +22,9 @@ export const actuatorRoutes = Router()
 
 actuatorRoutes.use(authMiddleware)
 
-actuatorRoutes.get('/devices/:deviceId/actuators', actuatorController.list)
-actuatorRoutes.post('/devices/:deviceId/actuators', validate(actuatorSchema), actuatorController.create)
+actuatorRoutes.get('/devices/:deviceId/actuators', asyncHandler(actuatorController.list))
+actuatorRoutes.post('/devices/:deviceId/actuators', validate(actuatorSchema), asyncHandler(actuatorController.create))
 
-actuatorRoutes.put('/actuators/:id', validate(actuatorSchema.partial()), actuatorController.update)
-actuatorRoutes.delete('/actuators/:id', actuatorController.remove)
-actuatorRoutes.post('/actuators/:id/command', validate(commandSchema), actuatorController.command)
+actuatorRoutes.put('/actuators/:id', validate(actuatorSchema.partial()), asyncHandler(actuatorController.update))
+actuatorRoutes.delete('/actuators/:id', asyncHandler(actuatorController.remove))
+actuatorRoutes.post('/actuators/:id/command', validate(commandSchema), asyncHandler(actuatorController.command))
