@@ -7,7 +7,7 @@ const schema = z.object({
   MONGO_URI: z.string().min(1),
   JWT_SECRET: z.string().min(32),
   JWT_EXPIRES_IN: z.string().default('7d'),
-  CLIENT_URL: z.string().url().default('http://localhost:3000'),
+  CLIENT_URL: z.string().min(1).default('http://localhost:3000'),
   MQTT_BROKER_URL: z.string().url().default('mqtt://127.0.0.1:1883'),
   MQTT_USERNAME: z.string().default(''),
   MQTT_PASSWORD: z.string().default(''),
@@ -16,3 +16,8 @@ const schema = z.object({
   GEMINI_MODEL: z.string().default('gemini-3.6-flash'),
 })
 export const env = schema.parse(process.env)
+
+export const allowedOrigins = env.CLIENT_URL
+  .split(',')
+  .map((origin) => origin.trim().replace(/\/+$/, ''))
+  .filter(Boolean)
