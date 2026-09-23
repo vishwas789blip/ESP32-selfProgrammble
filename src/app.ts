@@ -19,83 +19,23 @@ import { notFoundMiddleware } from './middleware/notFoundMiddleware.js';
 export const app = express();
 
 
-// =====================================================
-// CORS
-// =====================================================
+// ================= CORS =================
 
-const allowedOrigins = [
-  'https://esp32-iot-platform.vercel.app',
-  env.CLIENT_URL,
-  'http://localhost:5173',
-].filter(Boolean);
-
-const corsOptions = {
-  origin: (
-    origin: string | undefined,
-    callback: (error: Error | null, allow?: boolean) => void
-  ) => {
-
-    // Allow requests without Origin
-    // Useful for Postman / ESP32 / server-to-server
-    if (!origin) {
-      return callback(null, true);
-    }
-
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
-    console.log('[CORS] Blocked origin:', origin);
-
-    return callback(
-      new Error(`CORS blocked origin: ${origin}`)
-    );
-  },
-
-  methods: [
-    'GET',
-    'POST',
-    'PUT',
-    'PATCH',
-    'DELETE',
-    'OPTIONS',
-  ],
-
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-  ],
-
+app.use(cors({
+  origin: 'https://esp32-iot-platform.vercel.app',
   credentials: true,
-
-  optionsSuccessStatus: 204,
-};
-
-
-// CORS MUST BE BEFORE ROUTES
-app.use(cors(corsOptions));
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 
-
-// =====================================================
-// SECURITY
-// =====================================================
+// ================= MIDDLEWARE =================
 
 app.use(helmet());
-
-
-// =====================================================
-// BODY
-// =====================================================
 
 app.use(express.json({
   limit: '100kb',
 }));
-
-
-// =====================================================
-// LOGGING
-// =====================================================
 
 app.use(
   morgan(
@@ -106,42 +46,28 @@ app.use(
 );
 
 
-// =====================================================
-// ROOT
-// =====================================================
+// ================= HEALTH =================
 
 app.get('/', (_req, res) => {
-
   res.json({
     name: 'ESP32 Self-Programmable API',
     version: '1.0.0',
     status: 'running',
   });
-
 });
 
-
-// =====================================================
-// HEALTH
-// =====================================================
-
 app.get('/api/health', (_req, res) => {
-
   res.json({
     success: true,
-
     data: {
       status: 'ok',
       service: 'esp32-self-programmable-backend',
     },
   });
-
 });
 
 
-// =====================================================
-// ROUTES
-// =====================================================
+// ================= ROUTES =================
 
 app.use('/api/auth', authRoutes);
 
@@ -158,9 +84,7 @@ app.use('/api/events', eventRoutes);
 app.use('/api/ai', aiRoutes);
 
 
-// =====================================================
-// ERROR HANDLING
-// =====================================================
+// ================= ERRORS =================
 
 app.use(notFoundMiddleware);
 
