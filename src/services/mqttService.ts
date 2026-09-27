@@ -302,14 +302,45 @@ async function telemetry(raw: unknown) {
         continue
       }
 
-      const gpioKey = String(sensor.gpio)
+const sensorIdKey = String(sensor._id)
+const gpioKey = String(sensor.gpio)
 
-      if (!(gpioKey in readings)) {
-        continue
-      }
+const sensorType = String(sensor.type || '').toLowerCase()
 
-      const previousValue = sensor.value
-      const newValue = readings[gpioKey]
+let readingKey: string | null = null
+
+// 1. Preferred: exact Mongo sensor ID
+if (sensorIdKey in readings) {
+  readingKey = sensorIdKey
+}
+
+// 2. Temperature sensor sharing a DHT GPIO
+else if (
+  sensorType.includes('temp') &&
+  `${gpioKey}_temperature` in readings
+) {
+  readingKey = `${gpioKey}_temperature`
+}
+
+// 3. Humidity sensor sharing a DHT GPIO
+else if (
+  sensorType.includes('humid') &&
+  `${gpioKey}_humidity` in readings
+) {
+  readingKey = `${gpioKey}_humidity`
+}
+
+// 4. Generic GPIO fallback
+else if (gpioKey in readings) {
+  readingKey = gpioKey
+}
+
+if (!readingKey) {
+  continue
+}
+
+const previousValue = sensor.value
+const newValue = readings[readingKey]
 
       sensor.value = newValue
       sensor.lastUpdated = new Date()
