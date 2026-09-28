@@ -58,12 +58,14 @@ const tools = [
   },
   {
     name: 'send_command',
-    description: 'Send an immediate ON/OFF command to one actuator belonging to the current user, via MQTT.',
+    description: 'Send an immediate generic command to one actuator belonging to the current user, via MQTT. ON/OFF remains supported; other commands may use value/parameters depending on the actuator driver.',
     parameters: {
       type: 'object',
       properties: {
         actuatorId: { type: 'string', description: 'The actuatorId (Mongo ObjectId) from the context/snapshot. Never invent one.' },
-        command: { type: 'string', enum: ['ON', 'OFF'] },
+        command: { type: 'string', description: 'Driver command such as ON, OFF, SET, OPEN, CLOSE, BEEP, WRITE, etc.' },
+        value: { description: 'Optional scalar value for the actuator driver.' },
+        parameters: { type: 'object', properties: {} },
         duration: { type: 'number', description: 'Optional auto-off duration in seconds, for a timed ON command.' },
       },
       required: ['actuatorId', 'command'],
@@ -95,7 +97,9 @@ const tools = [
             type: 'object',
             properties: {
               actuatorId: { type: 'string', description: 'actuatorId (Mongo ObjectId) from the context.' },
-              command: { type: 'string', enum: ['ON', 'OFF'] },
+              command: { type: 'string', description: 'Driver command such as ON, OFF, SET, OPEN, CLOSE, BEEP, WRITE, etc.' },
+              value: { description: 'Optional scalar value for the actuator driver.' },
+              parameters: { type: 'object', properties: {} },
               duration: { type: 'number' },
             },
             required: ['actuatorId', 'command'],
@@ -169,8 +173,10 @@ async function runTool(userId: string, name: string, input: Record<string, unkno
       const actuatorId = String(input.actuatorId ?? '')
       const command = String(input.command ?? '')
       const duration = typeof input.duration === 'number' ? input.duration : undefined
+      const value = input.value
+      const parameters = input.parameters && typeof input.parameters === 'object' ? input.parameters as Record<string, unknown> : undefined
       if (!actuatorId || !command) throw badRequest('actuatorId and command are required')
-      return commandActuator(userId, actuatorId, command, duration)
+      return commandActuator(userId, actuatorId, command, duration, value, parameters)
     }
 
     case 'create_automation': {

@@ -105,7 +105,7 @@ async function assertAutomationRefsBelongToDevice(
  */
 async function resolveActionsForPublish(
   deviceId: string,
-  actions: Array<{ actuatorId?: unknown; command: string; duration?: number | null }>,
+  actions: Array<{ actuatorId?: unknown; command: string; value?: unknown; duration?: number | null; parameters?: Record<string, unknown> }>,
 ) {
   const actuatorIds = [
     ...new Set(
@@ -133,9 +133,11 @@ async function resolveActionsForPublish(
     .map((action) => ({
       actuatorId: nameById.get(String(action.actuatorId)),
       command: action.command,
+      ...(action.value !== undefined ? { value: action.value } : {}),
       ...(action.duration !== undefined && action.duration !== null
         ? { duration: action.duration }
         : {}),
+      ...(action.parameters ? { parameters: action.parameters } : {}),
     }))
 }
 
@@ -431,6 +433,8 @@ export async function commandActuator(
   id: string,
   command: string,
   duration?: number,
+  value?: unknown,
+  parameters?: Record<string, unknown>,
 ) {
   const actuator =
     await Actuator.findById(id)
@@ -449,23 +453,9 @@ export async function commandActuator(
     throw notFound()
   }
 
-  const normalized =
-    command.toUpperCase()
-
-  if (
-    !['ON', 'OFF'].includes(
-      normalized,
-    )
-  ) {
-    throw Object.assign(
-      new Error(
-        'Command must be ON or OFF',
-      ),
-      {
-        statusCode: 400,
-        code: 'INVALID_COMMAND',
-      },
-    )
+  const normalized = command.trim()
+  if (!normalized) {
+    throw Object.assign(new Error('Command is required'), { statusCode: 400, code: 'INVALID_COMMAND' })
   }
 
   await publishCommand(
@@ -475,20 +465,22 @@ export async function commandActuator(
       actuatorId:
         actuator.name,
       command: normalized,
-
-      ...(duration
-        ? { duration }
-        : {}),
+      ...(value !== undefined ? { value } : {}),
+      ...(duration ? { duration } : {}),
+      ...(parameters ? { parameters } : {}),
 
       timestamp:
         new Date().toISOString(),
     },
   )
 
-  actuator.state =
-    normalized.toLowerCase() as
-      | 'on'
-      | 'off'
+  if (normalized.toLowerCase() === 'on' || normalized.toLowerCase() === 'off') {
+    actuator.state = normalized.toLowerCase()
+  } else if (value !== undefined) {
+    actuator.state = value
+  } else {
+    actuator.state = normalized
+  }
 
   await actuator.save()
 

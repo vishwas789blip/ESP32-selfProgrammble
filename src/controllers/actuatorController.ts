@@ -51,5 +51,7 @@ export const actuatorController = {
       getParam(req.params.id),
       req.body.command,
       req.body.duration,
+      req.body.value,
+      req.body.parameters,
     )),
 };

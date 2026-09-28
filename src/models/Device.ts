@@ -45,6 +45,7 @@ const deviceSchema = new Schema(
     // NOT stored here — it's always derived live from the Sensor/Actuator
     // collections so it can never go stale.
     config: { type: Schema.Types.Mixed, default: {} },
+    metadata: { type: Schema.Types.Mixed, default: {} },
   },
   { timestamps: true }
 )

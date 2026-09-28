@@ -90,6 +90,21 @@ function evaluateCondition(
         .toLowerCase()
         .endsWith(String(normalizedExpected).toLowerCase())
 
+    case 'changed':
+      return true
+
+    case 'exists':
+      return normalizedCurrent !== undefined && normalizedCurrent !== null
+
+    case 'in':
+      return Array.isArray(normalizedExpected) && normalizedExpected.some(v => normalizeComparable(normalizedCurrent, v) === normalizeComparable(v, normalizedCurrent))
+
+    case 'between': {
+      if (!Array.isArray(normalizedExpected) || normalizedExpected.length < 2) return false
+      const n = Number(normalizedCurrent)
+      return Number.isFinite(n) && n >= Number(normalizedExpected[0]) && n <= Number(normalizedExpected[1])
+    }
+
     default:
       console.warn(
         `[AUTOMATION] Unsupported operator: ${operator}`,
@@ -145,9 +160,13 @@ async function executeAutomationActions(
     const payload = {
       type: 'actuator' as const,
       actuatorId: actuator.name,
-      command: command as 'ON' | 'OFF',
+      command,
+      ...(action.value !== undefined ? { value: action.value } : {}),
       ...(action.duration !== undefined && action.duration !== null
         ? { duration: action.duration }
+        : {}),
+      ...(action.parameters && typeof action.parameters === 'object'
+        ? { parameters: action.parameters }
         : {}),
       timestamp: new Date().toISOString(),
     }
@@ -173,19 +192,15 @@ async function executeAutomationActions(
     )
 
     const normalizedCommand = command.toLowerCase()
-
-    if (
-      normalizedCommand === 'on' ||
-      normalizedCommand === 'off'
-    ) {
-      actuator.state = normalizedCommand as 'on' | 'off'
-      await actuator.save()
-
-      broadcastActuatorUpdate(
-        String(device.userId),
-        actuator.toObject(),
-      )
+    if (normalizedCommand === 'on' || normalizedCommand === 'off') {
+      actuator.state = normalizedCommand
+    } else if (action.value !== undefined) {
+      actuator.state = action.value
+    } else {
+      actuator.state = command
     }
+    await actuator.save()
+    broadcastActuatorUpdate(String(device.userId), actuator.toObject())
 
     await createEvent({
       userId: String(device.userId),
@@ -359,13 +374,13 @@ export async function testAutomation(
 
     const sensor = sensors.find(s => String(s._id) === String(condition.sensorId))
     if (!sensor) throw new Error(`Automation sensor not found: ${condition.sensorId}`)
-    if (sensor.gpio === undefined || sensor.gpio === null) {
-      throw new Error(`Automation sensor ${sensor.name} has no GPIO configured`)
-    }
-
-    // Test every condition at its configured comparison value. The normal
-    // MQTT telemetry path will then evaluate the complete multi-condition rule.
-    readings[String(sensor.gpio)] = condition.value
+    // Prefer sensor ID so the test also works for I2C/SPI/UART/OneWire and
+    // virtual sensors that do not have a single GPIO. GPIO remains a fallback
+    // for older firmware.
+    const key = sensor.gpio === undefined || sensor.gpio === null
+      ? String(sensor._id)
+      : String(sensor.gpio)
+    readings[key] = condition.value
   }
 
   const telemetryPayload = {
