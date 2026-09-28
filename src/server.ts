@@ -3,6 +3,7 @@ import { connectDatabase } from './config/db.js'
 import { env } from './config/env.js'
 import { startMqtt, stopMqtt } from './services/mqttService.js'
 import { setupRealtime, realtimeWss } from './services/realtimeService.js'
+import { startDeviceMonitor, stopDeviceMonitor } from './services/deviceMonitor.js'
 
 connectDatabase().then(() => {
   const server = app.listen(env.PORT, () => {
@@ -12,8 +13,10 @@ connectDatabase().then(() => {
 
   setupRealtime(server)
   startMqtt()
+  startDeviceMonitor()
 
   const shutdown = () => {
+    stopDeviceMonitor()
     stopMqtt()
     realtimeWss.close()
     server.close(() => process.exit(0))
@@ -21,4 +24,7 @@ connectDatabase().then(() => {
 
   process.once('SIGINT', shutdown)
   process.once('SIGTERM', shutdown)
-}).catch(() => process.exit(1))
+}).catch((error) => {
+  console.error('Startup failed:', error instanceof Error ? error.message : error)
+  process.exit(1)
+})

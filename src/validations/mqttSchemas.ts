@@ -1,6 +1,12 @@
 import { z } from 'zod'
 
+// Backend -> device messages always carry an ISO-8601 timestamp.
 const timestamp = z.string().datetime({ offset: true }).optional()
+
+// Device -> backend messages: ESP32 firmware often has no RTC/NTP and sends millis(),
+// epoch seconds or a free-form string. Accepting only ISO strings made the whole
+// telemetry/status packet fail validation ("Invalid telemetry payload").
+const deviceTimestamp = z.union([z.string(), z.number()]).optional()
 
 /**
  * The backend intentionally does not maintain a closed sensor/actuator enum.
@@ -44,7 +50,7 @@ export const telemetrySchema = z.object({
   maxRules: z.number().optional(),
   enabledRules: z.number().optional(),
   rules: z.array(z.unknown()).optional(),
-  timestamp,
+  timestamp: deviceTimestamp,
 })
 
 export const statusSchema = z.object({
@@ -54,7 +60,7 @@ export const statusSchema = z.object({
   ipAddress: z.string().max(64).optional(),
   macAddress: z.string().max(100).optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
-  timestamp,
+  timestamp: deviceTimestamp,
 })
 
 /**
@@ -80,6 +86,7 @@ const configuredSensor = z.object({
   gpio: z.number().int().min(0).max(48).optional(),
   pins: z.record(z.string(), z.number().int().min(0).max(48)).optional(),
   address: z.union([z.number().int(), z.string()]).optional(),
+  channel: z.union([z.number().int(), z.string()]).optional(),
   unit: z.string().optional(),
   config: sensorConfig,
 })
@@ -92,6 +99,7 @@ const configuredActuator = z.object({
   gpio: z.number().int().min(0).max(48).optional(),
   pins: z.record(z.string(), z.number().int().min(0).max(48)).optional(),
   address: z.union([z.number().int(), z.string()]).optional(),
+  channel: z.union([z.number().int(), z.string()]).optional(),
   state: z.unknown().optional(),
   config: actuatorConfig,
 })

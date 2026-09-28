@@ -43,7 +43,11 @@ export const sensorController = {
     );
 
     const deviceId = String(item.deviceId);
+    const itemId = String(item._id);
     await item.deleteOne();
+
+    // Automations that referenced this sensor are now incomplete: disable them.
+    await resourceServices.disableAutomationsReferencing({ sensorId: itemId });
 
     await resourceServices.pushDeviceConfig(deviceId);
     send(res, null);

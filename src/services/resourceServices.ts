@@ -4,11 +4,15 @@ import { Sensor } from '../models/Sensor.js'
 import { Actuator } from '../models/Actuator.js'
 import { Automation } from '../models/Automation.js'
 import { createEvent } from './eventService.js'
+import { env } from '../config/env.js'
 import {
   publishCommand,
-  publishAutomation,
   pushDeviceConfig,
 } from './mqttService.js'
+import {
+  broadcastActuatorUpdate,
+  broadcastAutomationUpdate,
+} from './realtimeService.js'
 
 export { pushDeviceConfig }
 
@@ -96,84 +100,61 @@ async function assertAutomationRefsBelongToDevice(
 }
 
 /**
- * The device only knows actuators by name (it has no database), so any
- * automation payload published over MQTT must translate actuatorId
- * (a Mongo ObjectId) into the matching actuator's name — the same
- * identifier used in the actuators list of the device config and in
- * direct actuator commands. Actions whose actuator can no longer be
- * found (e.g. deleted after the automation was created) are dropped.
+ * Rules used to be published one by one to the retained `devices/<id>/automation`
+ * topic. That topic has a single retained slot, so only the most recent rule survived
+ * and a deleted rule stayed retained as a `deleted:true` message. The complete rule
+ * set now travels inside the retained config message (one mechanism, always
+ * consistent), and only when the ESP32 is the executor (AUTOMATION_EXECUTOR=device).
+ * In 'server' mode there is nothing to sync: the backend fires the commands itself.
+ * pushDeviceConfig() is best-effort, so this never fails the API request.
  */
-async function resolveActionsForPublish(
-  deviceId: string,
-  actions: Array<{ actuatorId?: unknown; command: string; value?: unknown; duration?: number | null; parameters?: Record<string, unknown> }>,
-) {
-  const actuatorIds = [
-    ...new Set(
-      actions
-        .map((a) => (a.actuatorId ? String(a.actuatorId) : null))
-        .filter((id): id is string => !!id),
-    ),
-  ]
+async function syncDeviceAutomations(...deviceMongoIds: string[]) {
+  if (env.AUTOMATION_EXECUTOR !== 'device') return
 
-  if (actuatorIds.length === 0) {
-    return []
+  for (const id of new Set(deviceMongoIds)) {
+    await pushDeviceConfig(id)
   }
-
-  const actuators = await Actuator.find({
-    _id: { $in: actuatorIds },
-    deviceId,
-  })
-
-  const nameById = new Map(
-    actuators.map((a) => [String(a._id), a.name]),
-  )
-
-  return actions
-    .filter((action) => action.actuatorId && nameById.has(String(action.actuatorId)))
-    .map((action) => ({
-      actuatorId: nameById.get(String(action.actuatorId)),
-      command: action.command,
-      ...(action.value !== undefined ? { value: action.value } : {}),
-      ...(action.duration !== undefined && action.duration !== null
-        ? { duration: action.duration }
-        : {}),
-      ...(action.parameters ? { parameters: action.parameters } : {}),
-    }))
 }
 
 /**
- * Publish the complete automation definition
- * for a device.
+ * A sensor/actuator was deleted: every enabled automation that referenced it is
+ * incomplete. Disable those (instead of leaving them half-working or silently
+ * deleting the user's rules) and tell the user through an event + WebSocket update.
  */
-async function publishCompleteAutomation(
-  automation: any,
-) {
-  const device = await Device.findById(
-    automation.deviceId,
+export async function disableAutomationsReferencing(ref: { sensorId?: string; actuatorId?: string }) {
+  if (!ref.sensorId && !ref.actuatorId) return []
+
+  const filter = ref.sensorId
+    ? { 'conditions.sensorId': oid(ref.sensorId), enabled: true }
+    : { 'actions.actuatorId': oid(ref.actuatorId as string), enabled: true }
+
+  const affected = await Automation.find(filter)
+  if (affected.length === 0) return []
+
+  await Automation.updateMany(
+    { _id: { $in: affected.map((a) => a._id) } },
+    { $set: { enabled: false, lastMatched: false } },
   )
 
-  if (!device) {
-    throw notFound()
+  for (const automation of affected) {
+    broadcastAutomationUpdate(String(automation.userId), {
+      ...automation.toObject(),
+      enabled: false,
+      lastMatched: false,
+    })
+
+    await createEvent({
+      userId: String(automation.userId),
+      deviceId: String(automation.deviceId),
+      type: 'automation',
+      message: `Automation "${automation.name}" was disabled because a ${ref.sensorId ? 'sensor' : 'actuator'} it uses was deleted`.slice(0, 500),
+      metadata: { automationId: String(automation._id), ...ref },
+    })
   }
 
-  await publishAutomation(
-    device.deviceId,
-    {
-      type: 'automation',
-      automationId: String(
-        automation._id,
-      ),
-      deviceId: device.deviceId,
-      name: automation.name,
-      enabled: automation.enabled,
-      conditions:
-        automation.conditions || [],
-      actions: await resolveActionsForPublish(
-        String(device._id),
-        automation.actions || [],
-      ),
-    },
-  )
+  await syncDeviceAutomations(...affected.map((a) => String(a.deviceId)))
+
+  return affected
 }
 
 export const devices = {
@@ -484,6 +465,12 @@ export async function commandActuator(
 
   await actuator.save()
 
+  // Optimistic state: the UI updates immediately, and the device's next telemetry
+  // (`actuatorStates`) corrects it if the command did not take effect. Automation
+  // triggered commands already broadcast this; manual commands did not, so other
+  // open tabs/clients stayed stale.
+  broadcastActuatorUpdate(userId, actuator.toObject())
+
   await createEvent({
     userId,
     deviceId:
@@ -567,36 +554,7 @@ export const automations = {
         ),
       })
 
-    /**
-     * IMPORTANT:
-     *
-     * Website created the automation.
-     * Now publish the COMPLETE automation
-     * to MQTT.
-     */
-    await publishAutomation(
-      device.deviceId,
-      {
-        type: 'automation',
-        automationId:
-          String(
-            automation._id,
-          ),
-        deviceId:
-          device.deviceId,
-        name:
-          automation.name,
-        enabled:
-          automation.enabled,
-        conditions:
-          automation.conditions ||
-          [],
-        actions: await resolveActionsForPublish(
-          String(device._id),
-          automation.actions || [],
-        ),
-      },
-    )
+    await syncDeviceAutomations(String(device._id))
 
     return automation
   },
@@ -646,10 +604,11 @@ export const automations = {
       )
     }
 
+    // The rule changed, so its edge-trigger latch starts fresh.
     const updated =
       await Automation.findByIdAndUpdate(
         id,
-        input,
+        { ...input, lastMatched: false },
         {
           new: true,
           runValidators: true,
@@ -660,22 +619,18 @@ export const automations = {
       throw notFound()
     }
 
-    /**
-     * Publish complete UPDATED
-     * automation.
-     */
-    await publishCompleteAutomation(
-      updated,
+    // Also resync the old device if the rule moved to another one.
+    await syncDeviceAutomations(
+      String(existing.deviceId),
+      String(updated.deviceId),
     )
 
     return updated
   },
 
   /**
-   * Delete:
-   *
-   * Publish an enabled:false message first
-   * so an ESP32 can remove/disable the rule.
+   * Delete: remove from MongoDB first, then resync the device so its rule list no
+   * longer contains the rule (no retained `deleted:true` leftovers).
    */
   remove: async (
     userId: string,
@@ -687,45 +642,17 @@ export const automations = {
         id,
       )
 
-    const device =
-      await Device.findById(
-        item.deviceId,
-      )
-
-    if (device) {
-      await publishAutomation(
-        device.deviceId,
-        {
-          type: 'automation',
-          automationId:
-            String(item._id),
-          deviceId:
-            device.deviceId,
-          name:
-            item.name,
-          enabled: false,
-          deleted: true,
-          conditions:
-            item.conditions || [],
-          actions: await resolveActionsForPublish(
-            String(device._id),
-            item.actions || [],
-          ),
-        },
-      )
-    }
-
     await Automation.findByIdAndDelete(
       id,
     )
+
+    await syncDeviceAutomations(String(item.deviceId))
 
     return null
   },
 
   /**
-   * Toggle:
-   *
-   * MongoDB -> MQTT complete rule
+   * Toggle: flips `enabled`, re-arms the edge-trigger latch and resyncs the device.
    */
   toggle: async (
     userId: string,
@@ -739,17 +666,12 @@ export const automations = {
 
     item.enabled =
       !item.enabled
+    item.lastMatched = false
 
     const saved =
       await item.save()
 
-    /**
-     * Publish the COMPLETE automation
-     * with its new enabled state.
-     */
-    await publishCompleteAutomation(
-      saved,
-    )
+    await syncDeviceAutomations(String(saved.deviceId))
 
     return saved
   },

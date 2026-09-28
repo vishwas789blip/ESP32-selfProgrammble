@@ -39,7 +39,11 @@ export const actuatorController = {
     );
 
     const deviceId = String(item.deviceId);
+    const itemId = String(item._id);
     await item.deleteOne();
+
+    // Automations that referenced this actuator are now incomplete: disable them.
+    await resourceServices.disableAutomationsReferencing({ actuatorId: itemId });
 
     await resourceServices.pushDeviceConfig(deviceId);
     send(res, null);

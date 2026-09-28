@@ -23,6 +23,10 @@ const automationSchema = new Schema({
   actions: { type: [actionSchema], default: [] },
   enabled: { type: Boolean, default: true },
   lastExecuted: { type: Date, default: null },
+  // Persistent edge-trigger latch: true while the complete condition set is true and
+  // the action has already fired. Stored in MongoDB (not RAM) so it survives restarts
+  // and can be claimed atomically.
+  lastMatched: { type: Boolean, default: false },
 }, { timestamps: true })
 
 export const Automation = model('Automation', automationSchema)

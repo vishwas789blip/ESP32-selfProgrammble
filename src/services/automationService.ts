@@ -4,8 +4,10 @@ import { Device } from '../models/Device.js'
 import { Sensor } from '../models/Sensor.js'
 import { Actuator } from '../models/Actuator.js'
 import { createEvent } from './eventService.js'
-import { mqttClient, topics } from '../config/mqtt.js'
+import { topics } from '../config/mqtt.js'
+import { publishMessage } from './mqttPublisher.js'
 import { broadcastActuatorUpdate } from './realtimeService.js'
+import { evaluateCondition, valueThatSatisfies, NO_PREVIOUS } from './automationLogic.js'
 
 type DeviceInfo = {
   _id: Types.ObjectId
@@ -13,104 +15,40 @@ type DeviceInfo = {
   userId: Types.ObjectId
 }
 
-/**
- * Runtime latch for edge-triggered automations. An automation fires when
- * its complete condition set changes from false -> true. While it remains
- * true, repeated telemetry packets do not fire the action again. A false
- * evaluation resets the latch so the next true transition can fire again.
- *
- * The key is the automation id, so this works for any sensor/actuator type
- * and for multi-condition automations.
- */
-const automationMatchState = new Map<string, boolean>()
-
-function normalizeComparable(value: unknown, other: unknown): unknown {
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (trimmed === 'true') return true
-    if (trimmed === 'false') return false
-
-    const otherIsNumber =
-      typeof other === 'number' ||
-      (typeof other === 'string' && other.trim() !== '' && Number.isFinite(Number(other)))
-
-    if (otherIsNumber && trimmed !== '' && Number.isFinite(Number(trimmed))) {
-      return Number(trimmed)
-    }
-  }
-
-  return value
+type ExecutionResult = {
+  /** "actuatorName:COMMAND" for every command that reached the broker. */
+  published: string[]
+  /** Commands that could not be published (broker down / timeout). */
+  failed: string[]
 }
 
-function evaluateCondition(
-  operator: string,
-  currentValue: unknown,
-  expectedValue: unknown,
-): boolean {
-  const normalizedCurrent = normalizeComparable(currentValue, expectedValue)
-  const normalizedExpected = normalizeComparable(expectedValue, currentValue)
+const httpError = (statusCode: number, code: string, message: string) =>
+  Object.assign(new Error(message), { statusCode, code })
 
-  switch (operator) {
-    case 'equals':
-    case '==':
-      return normalizedCurrent === normalizedExpected
+const errMsg = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
-    case 'not_equals':
-    case '!=':
-      return normalizedCurrent !== normalizedExpected
+/**
+ * Edge-trigger latch, stored in MongoDB (Automation.lastMatched).
+ *
+ * An automation fires when its complete condition set goes false -> true. While it
+ * stays true, further telemetry does not fire it again. The latch is claimed with a
+ * single atomic update, so two telemetry packets processed at the same time (or two
+ * backend instances) cannot both fire the same rule, and a restart does not re-fire
+ * rules whose conditions were already true.
+ */
+async function claimTrigger(automationId: Types.ObjectId): Promise<boolean> {
+  const result = await Automation.updateOne(
+    { _id: automationId, lastMatched: { $ne: true } },
+    { $set: { lastMatched: true } },
+  )
+  return result.modifiedCount === 1
+}
 
-    case '>':
-    case 'greater_than':
-      return Number(normalizedCurrent) > Number(normalizedExpected)
-
-    case '>=':
-    case 'greater_than_or_equal':
-      return Number(normalizedCurrent) >= Number(normalizedExpected)
-
-    case '<':
-    case 'less_than':
-      return Number(normalizedCurrent) < Number(normalizedExpected)
-
-    case '<=':
-    case 'less_than_or_equal':
-      return Number(normalizedCurrent) <= Number(normalizedExpected)
-
-    case 'contains':
-      return String(normalizedCurrent)
-        .toLowerCase()
-        .includes(String(normalizedExpected).toLowerCase())
-
-    case 'starts_with':
-      return String(normalizedCurrent)
-        .toLowerCase()
-        .startsWith(String(normalizedExpected).toLowerCase())
-
-    case 'ends_with':
-      return String(normalizedCurrent)
-        .toLowerCase()
-        .endsWith(String(normalizedExpected).toLowerCase())
-
-    case 'changed':
-      return true
-
-    case 'exists':
-      return normalizedCurrent !== undefined && normalizedCurrent !== null
-
-    case 'in':
-      return Array.isArray(normalizedExpected) && normalizedExpected.some(v => normalizeComparable(normalizedCurrent, v) === normalizeComparable(v, normalizedCurrent))
-
-    case 'between': {
-      if (!Array.isArray(normalizedExpected) || normalizedExpected.length < 2) return false
-      const n = Number(normalizedCurrent)
-      return Number.isFinite(n) && n >= Number(normalizedExpected[0]) && n <= Number(normalizedExpected[1])
-    }
-
-    default:
-      console.warn(
-        `[AUTOMATION] Unsupported operator: ${operator}`,
-      )
-      return false
-  }
+async function releaseLatch(automationId: Types.ObjectId): Promise<void> {
+  await Automation.updateOne(
+    { _id: automationId, lastMatched: true },
+    { $set: { lastMatched: false } },
+  )
 }
 
 async function executeAutomationActions(
@@ -120,19 +58,17 @@ async function executeAutomationActions(
   currentValue: unknown,
   previousValue: unknown,
   source: 'telemetry' | 'test' = 'telemetry',
-) {
+): Promise<ExecutionResult> {
+  const result: ExecutionResult = { published: [], failed: [] }
+
   if (automation.actions.length === 0) {
-    console.log(
-      `[AUTOMATION] ${automation.name} matched but has no actions`,
-    )
-    return
+    console.log(`[AUTOMATION] ${automation.name} matched but has no actions`)
+    return result
   }
 
   for (const action of automation.actions) {
     if (!action.actuatorId) {
-      console.warn(
-        `[AUTOMATION] Missing actuator in ${automation.name}`,
-      )
+      console.warn(`[AUTOMATION] Missing actuator in ${automation.name}`)
       continue
     }
 
@@ -142,18 +78,17 @@ async function executeAutomationActions(
     })
 
     if (!actuator) {
-      console.warn(
-        `[AUTOMATION] Actuator not found: ${action.actuatorId}`,
-      )
+      console.warn(`[AUTOMATION] Actuator not found: ${action.actuatorId}`)
       continue
     }
 
-    const command = String(action.command).trim().toUpperCase()
+    // Send the command exactly as the user configured it. It used to be upper-cased,
+    // which turned custom commands such as "setAngle" into "SETANGLE" (manual commands
+    // are sent as typed, so automation and manual control disagreed).
+    const command = String(action.command).trim()
 
     if (!command) {
-      console.warn(
-        `[AUTOMATION] Empty command for ${actuator.name}`,
-      )
+      console.warn(`[AUTOMATION] Empty command for ${actuator.name}`)
       continue
     }
 
@@ -162,38 +97,27 @@ async function executeAutomationActions(
       actuatorId: actuator.name,
       command,
       ...(action.value !== undefined ? { value: action.value } : {}),
-      ...(action.duration !== undefined && action.duration !== null
-        ? { duration: action.duration }
-        : {}),
-      ...(action.parameters && typeof action.parameters === 'object'
-        ? { parameters: action.parameters }
-        : {}),
+      ...(action.duration !== undefined && action.duration !== null ? { duration: action.duration } : {}),
+      ...(action.parameters && typeof action.parameters === 'object' ? { parameters: action.parameters } : {}),
       timestamp: new Date().toISOString(),
     }
 
-    await new Promise<void>((resolve, reject) => {
-      mqttClient.publish(
-        topics.command(device.deviceId),
-        JSON.stringify(payload),
-        { qos: 1 },
-        error => {
-          if (error) reject(error)
-          else resolve()
-        },
-      )
-    })
+    const label = `${actuator.name}:${command}`
 
-    console.log(
-      `[AUTOMATION] Triggered: ${automation.name}`,
-    )
+    try {
+      await publishMessage(topics.command(device.deviceId), payload, { qos: 1 })
+    } catch (error) {
+      console.error(`[AUTOMATION] ${automation.name}: publishing ${label} failed: ${errMsg(error)}`)
+      result.failed.push(label)
+      continue
+    }
 
-    console.log(
-      `[AUTOMATION] ${actuator.name} -> ${command}`,
-    )
+    result.published.push(label)
+    console.log(`[AUTOMATION] Triggered: ${automation.name} (${actuator.name} -> ${command})`)
 
-    const normalizedCommand = command.toLowerCase()
-    if (normalizedCommand === 'on' || normalizedCommand === 'off') {
-      actuator.state = normalizedCommand
+    const lowered = command.toLowerCase()
+    if (lowered === 'on' || lowered === 'off') {
+      actuator.state = lowered
     } else if (action.value !== undefined) {
       actuator.state = action.value
     } else {
@@ -206,8 +130,7 @@ async function executeAutomationActions(
       userId: String(device.userId),
       deviceId: String(device._id),
       type: 'actuator',
-      message:
-        `Automation triggered: ${actuator.name} ${command}`,
+      message: `Automation triggered: ${actuator.name} ${command}`,
       metadata: {
         automationId: String(automation._id),
         automationName: automation.name,
@@ -221,10 +144,14 @@ async function executeAutomationActions(
     })
   }
 
-  await Automation.updateOne(
-    { _id: automation._id },
-    { $set: { lastExecuted: new Date() } },
-  )
+  if (result.published.length > 0) {
+    await Automation.updateOne(
+      { _id: automation._id },
+      { $set: { lastExecuted: new Date() } },
+    )
+  }
+
+  return result
 }
 
 export async function evaluateAutomations(
@@ -234,9 +161,7 @@ export async function evaluateAutomations(
   previousValue: unknown,
 ) {
   if (!Types.ObjectId.isValid(sensorId)) {
-    console.warn(
-      `[AUTOMATION] Invalid sensor ID: ${sensorId}`,
-    )
+    console.warn(`[AUTOMATION] Invalid sensor ID: ${sensorId}`)
     return
   }
 
@@ -248,96 +173,90 @@ export async function evaluateAutomations(
     'conditions.sensorId': sensorObjectId,
   })
 
-  if (automations.length === 0) {
-    console.log(
-      `[AUTOMATION] No automation matched sensor ${sensorId}`,
-    )
-    return
-  }
-
-  console.log(
-    `[AUTOMATION] Checking ${automations.length} automation(s)`,
-  )
+  if (automations.length === 0) return
 
   for (const automation of automations) {
-    const relevantIds = automation.conditions
-      .map((c) => (c.sensorId ? String(c.sensorId) : null))
-      .filter((id): id is string => !!id)
+    try {
+      const relevantIds = automation.conditions
+        .map((c) => (c.sensorId ? String(c.sensorId) : null))
+        .filter((id): id is string => !!id)
 
-    const knownValues = new Map<string, unknown>([[sensorId, currentValue]])
-    const missingIds = [...new Set(relevantIds)].filter((id) => !knownValues.has(id))
-    if (missingIds.length > 0) {
-      // Scoped to this automation's own device: conditions are validated
-      // to reference only sensors on that device when the automation is
-      // created/updated, but this scoping is kept here too as a second
-      // line of defense against ever reading another device's sensor.
-      const otherSensors = await Sensor.find({ _id: { $in: missingIds }, deviceId: device._id })
-      for (const s of otherSensors) knownValues.set(String(s._id), s.value)
+      const knownValues = new Map<string, unknown>([[sensorId, currentValue]])
+      const missingIds = [...new Set(relevantIds)].filter((id) => !knownValues.has(id))
+      if (missingIds.length > 0) {
+        // Scoped to this automation's own device as a second line of defense against
+        // ever reading another device's sensor.
+        const otherSensors = await Sensor.find({ _id: { $in: missingIds }, deviceId: device._id })
+        for (const s of otherSensors) knownValues.set(String(s._id), s.value)
+      }
+
+      const automationMatched =
+        automation.conditions.length > 0 &&
+        automation.conditions.every((condition) => {
+          if (!condition.sensorId) return false
+          const key = String(condition.sensorId)
+          const value = knownValues.get(key)
+          // The previous value is only known for the sensor that just reported.
+          const previous = key === sensorId ? previousValue : NO_PREVIOUS
+          const matched = evaluateCondition(condition.operator, value, condition.value, previous)
+
+          console.log(
+            `[AUTOMATION] ${automation.name}: ${String(value)} ${condition.operator} ${String(condition.value)} => ${matched}`,
+          )
+
+          return matched
+        })
+
+      if (!automationMatched) {
+        // Conditions are false again: re-arm so the next false -> true transition fires.
+        if (automation.lastMatched) await releaseLatch(automation._id)
+        continue
+      }
+
+      if (automation.lastMatched) {
+        console.log(`[AUTOMATION] ${automation.name}: conditions remain true; action already triggered`)
+        continue
+      }
+
+      // Rising edge. Claim the latch atomically; if someone else got it first, stop.
+      if (!(await claimTrigger(automation._id))) continue
+
+      let outcome: ExecutionResult
+      try {
+        outcome = await executeAutomationActions(automation, device, sensorId, currentValue, previousValue, 'telemetry')
+      } catch (error) {
+        await releaseLatch(automation._id).catch(() => {})
+        throw error
+      }
+
+      // Nothing reached the device (broker down, actuator deleted, ...): re-arm the
+      // latch so the rule can retry on the next telemetry packet instead of staying
+      // silently "already triggered".
+      if (outcome.failed.length > 0 || outcome.published.length === 0) {
+        await releaseLatch(automation._id)
+      }
+    } catch (error) {
+      // One broken rule must not stop the other rules.
+      console.error(`[AUTOMATION] ${automation.name} failed: ${errMsg(error)}`)
     }
-
-    const automationMatched =
-      automation.conditions.length > 0 &&
-      automation.conditions.every((condition) => {
-        if (!condition.sensorId) return false
-        const value = knownValues.get(String(condition.sensorId))
-        const matched = evaluateCondition(condition.operator, value, condition.value)
-
-        console.log(
-          `[AUTOMATION] ${automation.name}: ` +
-          `${String(value)} ` +
-          `${condition.operator} ` +
-          `${String(condition.value)} ` +
-          `=> ${matched}`,
-        )
-
-        return matched
-      })
-
-    const automationKey = String(automation._id)
-    const wasMatched = automationMatchState.get(automationKey) ?? false
-
-    if (!automationMatched) {
-      // Reset the latch. The next false -> true transition is allowed to fire.
-      automationMatchState.set(automationKey, false)
-      continue
-    }
-
-    if (wasMatched) {
-      console.log(
-        `[AUTOMATION] ${automation.name}: conditions remain true; action already triggered`,
-      )
-      continue
-    }
-
-    // Rising-edge trigger: false -> true only.
-    automationMatchState.set(automationKey, true)
-
-    await executeAutomationActions(
-      automation,
-      device,
-      sensorId,
-      currentValue,
-      previousValue,
-      'telemetry',
-    )
   }
 }
 
 /**
- * Website-only test path.
+ * Website "Test" button.
  *
- * It publishes a synthetic telemetry packet to the SAME MQTT telemetry topic
- * used by the ESP32. The normal MQTT telemetry handler receives that packet,
- * updates the sensor, runs evaluateAutomations(), and publishes the actuator
- * command. This keeps the test path identical to the real device path and
- * works for any registered sensor/actuator pair.
+ * Simulates the rule without touching real data: it works out a value for each
+ * condition that makes it true, checks that the whole rule really would fire, and
+ * then sends the rule's actual commands to the actuators. It does NOT write fake
+ * readings into the sensors, does not mark the device online, does not broadcast
+ * fake telemetry and does not touch the edge-trigger latch.
  */
 export async function testAutomation(
   userId: string,
   automationId: string,
 ) {
   if (!Types.ObjectId.isValid(automationId)) {
-    throw new Error('Invalid automation ID')
+    throw httpError(400, 'INVALID_ID', 'Invalid automation ID')
   }
 
   const automation = await Automation.findOne({
@@ -345,73 +264,105 @@ export async function testAutomation(
     userId: new Types.ObjectId(userId),
   })
 
-  if (!automation) throw new Error('Automation not found')
-  if (!automation.enabled) throw new Error('Enable the automation before testing it')
-  if (automation.conditions.length === 0) throw new Error('Automation has no sensor conditions')
-  if (automation.actions.length === 0) throw new Error('Automation has no actions')
+  if (!automation) throw httpError(404, 'NOT_FOUND', 'Automation not found')
+  if (!automation.enabled) throw httpError(400, 'AUTOMATION_DISABLED', 'Enable the automation before testing it')
+  if (automation.conditions.length === 0) throw httpError(400, 'NO_CONDITIONS', 'Automation has no sensor conditions')
+  if (automation.actions.length === 0) throw httpError(400, 'NO_ACTIONS', 'Automation has no actions')
 
   const device = await Device.findOne({
     _id: automation.deviceId,
     userId: new Types.ObjectId(userId),
   })
-  if (!device) throw new Error('Device not found')
+  if (!device) throw httpError(404, 'NOT_FOUND', 'Device not found')
+
+  const conditionSensorIds = [...new Set(
+    automation.conditions.map(c => (c.sensorId ? String(c.sensorId) : '')).filter(Boolean),
+  )]
 
   const sensors = await Sensor.find({
-    _id: { $in: automation.conditions.map(c => c.sensorId).filter(Boolean) },
+    _id: { $in: conditionSensorIds },
     deviceId: device._id,
   })
 
-  const conditionSensorIds = [...new Set(automation.conditions.map(c => c.sensorId ? String(c.sensorId) : ''))].filter(Boolean)
   if (sensors.length !== conditionSensorIds.length) {
-    throw new Error('One or more automation sensors were not found for this device')
+    throw httpError(400, 'INVALID_REFERENCE', 'One or more automation sensors were not found for this device')
   }
 
-  const readings: Record<string, unknown> = {}
+  // sensorId -> simulated value (+ simulated previous value for `changed`)
+  const simulatedValues = new Map<string, unknown>()
+  const simulatedPrevious = new Map<string, unknown>()
 
   for (const condition of automation.conditions) {
-    if (!condition.sensorId) throw new Error('Automation has a condition without a sensor')
-    if (condition.value === undefined) throw new Error('Automation condition has no test value')
-
     const sensor = sensors.find(s => String(s._id) === String(condition.sensorId))
-    if (!sensor) throw new Error(`Automation sensor not found: ${condition.sensorId}`)
-    // Prefer sensor ID so the test also works for I2C/SPI/UART/OneWire and
-    // virtual sensors that do not have a single GPIO. GPIO remains a fallback
-    // for older firmware.
-    const key = sensor.gpio === undefined || sensor.gpio === null
-      ? String(sensor._id)
-      : String(sensor.gpio)
-    readings[key] = condition.value
+    if (!sensor) throw httpError(400, 'INVALID_REFERENCE', `Automation sensor not found: ${condition.sensorId}`)
+
+    const simulation = valueThatSatisfies(condition.operator, condition.value, sensor.value)
+    if (!simulation.ok) {
+      throw httpError(400, 'CANNOT_SIMULATE', `Cannot simulate "${sensor.name}": ${simulation.reason}`)
+    }
+
+    simulatedValues.set(String(sensor._id), simulation.value)
+    if ('previous' in simulation) simulatedPrevious.set(String(sensor._id), simulation.previous)
   }
 
-  const telemetryPayload = {
-    deviceId: device.deviceId,
-    readings,
-    timestamp: new Date().toISOString(),
-  }
-
-  const telemetryTopic = `devices/${device.deviceId}/telemetry`
-
-  await new Promise<void>((resolve, reject) => {
-    mqttClient.publish(
-      telemetryTopic,
-      JSON.stringify(telemetryPayload),
-      { qos: 1 },
-      error => error ? reject(error) : resolve(),
-    )
+  // Verify with the real evaluator. Two conditions on the same sensor can contradict
+  // each other (> 10 AND < 5); then the rule can never fire and we say so.
+  const wouldFire = automation.conditions.every(condition => {
+    const key = String(condition.sensorId)
+    const previous = simulatedPrevious.has(key) ? simulatedPrevious.get(key) : NO_PREVIOUS
+    return evaluateCondition(condition.operator, simulatedValues.get(key), condition.value, previous)
   })
 
-  console.log(`[AUTOMATION TEST] Published synthetic telemetry for ${automation.name} (${automation.conditions.length} condition(s))`)
+  const first = sensors[0]
+  const simulated = sensors.map(s => ({
+    sensorId: String(s._id),
+    sensorName: s.name,
+    value: simulatedValues.get(String(s._id)),
+  }))
 
-  return {
+  const base = {
     tested: true,
-    triggered: true,
     automationId: String(automation._id),
     automationName: automation.name,
-    sensorId: String(sensors[0]._id),
-    sensorName: sensors[0].name,
-    gpio: sensors[0].gpio,
-    simulatedValue: automation.conditions.map(c => c.value),
-    topic: telemetryTopic,
-    message: `Synthetic telemetry published for all ${automation.conditions.length} condition(s); the normal automation engine will process the complete rule.`,
+    sensorId: String(first._id),
+    sensorName: first.name,
+    gpio: first.gpio,
+    simulatedValue: simulated.map(s => s.value),
+    simulated,
+    topic: topics.command(device.deviceId),
+  }
+
+  if (!wouldFire) {
+    return {
+      ...base,
+      triggered: false,
+      commands: [] as string[],
+      failed: [] as string[],
+      message: 'The conditions of this rule contradict each other, so it can never fire. No command was sent.',
+    }
+  }
+
+  const outcome = await executeAutomationActions(
+    automation,
+    { _id: device._id, deviceId: device.deviceId, userId: device.userId },
+    String(first._id),
+    simulatedValues.get(String(first._id)),
+    simulatedPrevious.get(String(first._id)),
+    'test',
+  )
+
+  if (outcome.published.length === 0 && outcome.failed.length > 0) {
+    throw httpError(503, 'MQTT_UNAVAILABLE', 'MQTT broker is not reachable, no command was sent')
+  }
+
+  return {
+    ...base,
+    triggered: outcome.published.length > 0,
+    commands: outcome.published,
+    failed: outcome.failed,
+    message:
+      outcome.published.length > 0
+        ? `Simulated readings satisfy the rule; sent ${outcome.published.length} command(s) to the device. Sensor data was not modified.`
+        : 'The rule would fire, but none of its actuators exist any more, so no command was sent.',
   }
 }
