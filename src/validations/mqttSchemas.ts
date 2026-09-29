@@ -125,8 +125,27 @@ const configuredAutomation = z.object({
 export const configSchema = z.object({
   deviceId: z.string().min(1),
   protocolVersion: z.string().optional(),
+  // Config synchronisation: the ESP32 echoes these back in CONFIG_ACK.
+  configVersion: z.number().int().positive().optional(),
+  configHash: z.string().max(64).optional(),
   sensors: z.array(configuredSensor),
   actuators: z.array(configuredActuator),
   automations: z.array(configuredAutomation).optional(),
   settings: z.record(z.string(), z.unknown()).optional(),
 }).passthrough()
+
+/**
+ * Device -> backend acknowledgement on `devices/<deviceId>/config/ack`.
+ * `applied` means the ESP32 parsed the config and reconfigured its hardware.
+ */
+export const configAckSchema = z.object({
+  deviceId: z.string().min(1),
+  configVersion: z.number().int().min(0),
+  configHash: z.string().max(64).optional(),
+  status: z.enum(['applied', 'failed']),
+  error: z.string().max(300).optional(),
+  sensors: z.number().int().min(0).optional(),
+  actuators: z.number().int().min(0).optional(),
+  firmwareVersion: z.string().max(100).optional(),
+  timestamp: deviceTimestamp,
+})

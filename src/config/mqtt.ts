@@ -24,13 +24,26 @@ mqttClient.on('error', () => {})
 export const topics = {
   telemetry: 'devices/+/telemetry',
   status: 'devices/+/status',
+  // Device -> backend: "I received/applied config version N".
+  configAck: 'devices/+/config/ack',
   command: (id: string) => `devices/${id}/command`,
   config: (id: string) => `devices/${id}/config`,
   automation: (id: string) => `devices/${id}/automation`,
 }
 
-export function deviceIdFromTopic(topic: string, kind: 'telemetry' | 'status') {
+export type DeviceTopicKind = 'telemetry' | 'status' | 'config/ack'
+
+/**
+ * Extracts the deviceId from `devices/<deviceId>/<kind>`.
+ * The id is returned exactly as it appears in the topic (no trimming, no
+ * case-folding) so that the DB lookup is a strict, exact match.
+ */
+export function deviceIdFromTopic(topic: string, kind: DeviceTopicKind) {
+  const suffix = kind.split('/')
   const parts = topic.split('/')
-  if (parts.length !== 3 || parts[0] !== 'devices' || parts[2] !== kind) return null
+
+  if (parts.length !== 2 + suffix.length || parts[0] !== 'devices') return null
+  if (suffix.some((part, index) => parts[2 + index] !== part)) return null
+
   return parts[1] || null
 }

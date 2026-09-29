@@ -1,5 +1,11 @@
+import { createHash } from 'node:crypto'
 import { Types } from 'mongoose'
-import { mqttClient, topics, deviceIdFromTopic } from '../config/mqtt.js'
+import {
+  mqttClient,
+  topics,
+  deviceIdFromTopic,
+  type DeviceTopicKind,
+} from '../config/mqtt.js'
 import { env } from '../config/env.js'
 import { Device } from '../models/Device.js'
 import { Sensor } from '../models/Sensor.js'
@@ -11,11 +17,13 @@ import {
   statusSchema,
   commandSchema,
   configSchema,
+  configAckSchema,
 } from '../validations/mqttSchemas.js'
 import { evaluateAutomations } from './automationService.js'
 import {
   broadcastDeviceTelemetry,
   broadcastDeviceStatus,
+  broadcastDeviceUpdate,
   broadcastSensorUpdate,
   broadcastActuatorUpdate,
 } from './realtimeService.js'
@@ -35,22 +43,124 @@ const log = (message: string, error?: unknown) => {
   console.error(`[MQTT] ${message}${detail ? `: ${detail}` : ''}`)
 }
 
+const logConfig = (message: string, error?: unknown) => {
+  if (error === undefined) {
+    console.log(`[CONFIG] ${message}`)
+    return
+  }
+
+  const detail = error instanceof Error ? error.message : String(error)
+  console.error(`[CONFIG] ${message}${detail ? `: ${detail}` : ''}`)
+}
+
 /**
  * "Unknown device" messages can arrive many times per second from a stray
- * publisher. Log each unknown device at most once per minute so real errors
- * do not get buried.
+ * publisher (or from a device whose DEVICE_ID does not match MongoDB). Each
+ * unknown (kind, deviceId) pair is logged at most once per minute, but every
+ * log line carries enough context to find the cause: topic, payload snippet and
+ * a hint about what is registered in MongoDB.
  */
 const UNKNOWN_DEVICE_LOG_INTERVAL_MS = 60_000
-const unknownDeviceLastLogged = new Map<string, number>()
+const unknownDeviceState = new Map<string, { last: number; suppressed: number }>()
 
-function logUnknownDevice(deviceId: string) {
+const escapeRegex = (value: string) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+async function unknownDeviceHint(topicDeviceId: string): Promise<string> {
+  const trimmed = topicDeviceId.trim()
+  const notes: string[] = []
+
+  if (trimmed !== topicDeviceId) {
+    notes.push('the id contains leading/trailing whitespace')
+  }
+
+  const [nearMatches, total] = await Promise.all([
+    Device.find({ deviceId: new RegExp(`^${escapeRegex(trimmed)}$`, 'i') })
+      .select('deviceId')
+      .limit(3)
+      .lean(),
+    Device.countDocuments(),
+  ])
+
+  if (nearMatches.length > 0) {
+    notes.push(
+      `MongoDB has a near-identical id (${nearMatches
+        .map((device) => `"${device.deviceId}"`)
+        .join(', ')}); ids are case-sensitive, so make firmware DEVICE_ID and the dashboard deviceId exactly equal`,
+    )
+  } else if (total === 0) {
+    notes.push('no devices are registered in MongoDB yet; create the device on the dashboard first')
+  } else {
+    notes.push(
+      `${total} device(s) registered but none equals this id; register it on the dashboard or fix DEVICE_ID in the firmware`,
+    )
+  }
+
+  return notes.join('; ')
+}
+
+async function logUnknownDevice(
+  topicDeviceId: string,
+  kind: DeviceTopicKind,
+  raw?: unknown,
+) {
+  const key = `${kind}:${topicDeviceId}`
   const now = Date.now()
-  const last = unknownDeviceLastLogged.get(deviceId) ?? 0
+  const state = unknownDeviceState.get(key) ?? { last: 0, suppressed: 0 }
 
-  if (now - last < UNKNOWN_DEVICE_LOG_INTERVAL_MS) return
+  if (now - state.last < UNKNOWN_DEVICE_LOG_INTERVAL_MS) {
+    state.suppressed += 1
+    unknownDeviceState.set(key, state)
+    return
+  }
 
-  unknownDeviceLastLogged.set(deviceId, now)
-  log(`Unknown device message: ${deviceId}`)
+  const suppressed = state.suppressed
+  unknownDeviceState.set(key, { last: now, suppressed: 0 })
+
+  let snippet = ''
+  try {
+    snippet = JSON.stringify(raw ?? null).slice(0, 200)
+  } catch {
+    snippet = '<unserializable>'
+  }
+
+  let hint = ''
+  try {
+    hint = await unknownDeviceHint(topicDeviceId)
+  } catch (error) {
+    hint = `could not query MongoDB (${error instanceof Error ? error.message : String(error)})`
+  }
+
+  log(
+    `Unknown device message: id="${topicDeviceId}" kind=${kind} ` +
+      `topic=devices/${topicDeviceId}/${kind} payload=${snippet} | ${hint}` +
+      (suppressed > 0 ? ` | ${suppressed} similar message(s) suppressed` : ''),
+  )
+}
+
+/**
+ * "Device recognized" is logged once per device per backend MQTT session (and
+ * again after the device goes offline / the broker reconnects). "Telemetry
+ * received" is rate-limited so it confirms the pipeline without flooding.
+ */
+const recognizedDevices = new Set<string>()
+
+function logRecognized(deviceId: string) {
+  if (recognizedDevices.has(deviceId)) return
+
+  recognizedDevices.add(deviceId)
+  log(`Device recognized: ${deviceId}`)
+}
+
+const TELEMETRY_LOG_INTERVAL_MS = 60_000
+const telemetryLastLogged = new Map<string, number>()
+
+function logTelemetryReceived(deviceId: string, readingCount: number) {
+  const now = Date.now()
+  if (now - (telemetryLastLogged.get(deviceId) ?? 0) < TELEMETRY_LOG_INTERVAL_MS) return
+
+  telemetryLastLogged.set(deviceId, now)
+  log(`Telemetry received: ${deviceId} (${readingCount} reading(s))`)
 }
 
 let started = false
@@ -124,22 +234,80 @@ export function publishConfig(deviceId: string, input: unknown) {
  *   -> ESP32 evaluates automations. Enabled rules are sent in the config.
  */
 
-export async function pushDeviceConfig(deviceMongoId: string) {
+/**
+ * Config synchronisation
+ *
+ *   DB updated -> config generated (+ configVersion) -> MQTT published (retained)
+ *              -> ESP32 applies -> CONFIG_ACK -> Device.configStatus = 'acked'
+ *
+ * - configVersion only increases when the generated content changes (sha256).
+ *   Re-sending unchanged content (device reconnect, resync) reuses the version,
+ *   so the ESP32 can skip re-applying it and simply acknowledge again.
+ * - The message is retained (QoS 1): an ESP32 that reconnects receives the
+ *   latest config from the broker immediately, even if the backend is down.
+ * - Pushes for one device are serialised, so an older DB snapshot can never be
+ *   published after a newer one.
+ */
+const CONFIG_HASH_LENGTH = 12
+const deviceConfigLocks = new Map<string, Promise<unknown>>()
+
+function withConfigLock<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const previous = deviceConfigLocks.get(key) ?? Promise.resolve()
+  const next = previous.catch(() => undefined).then(task)
+
+  deviceConfigLocks.set(key, next)
+
+  const cleanup = () => {
+    if (deviceConfigLocks.get(key) === next) deviceConfigLocks.delete(key)
+  }
+  next.then(cleanup, cleanup)
+
+  return next
+}
+
+// Key-order independent JSON so the same config always produces the same hash.
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, current) => {
+    if (current && typeof current === 'object' && !Array.isArray(current)) {
+      const source = current as Record<string, unknown>
+      return Object.keys(source)
+        .sort()
+        .reduce<Record<string, unknown>>((sorted, key) => {
+          sorted[key] = source[key]
+          return sorted
+        }, {})
+    }
+    return current
+  })
+}
+
+// Config resync: a device that is online but has not confirmed the latest
+// config gets it re-sent (cooldown + attempt limit, so an old firmware that
+// never sends CONFIG_ACK is not spammed forever).
+const CONFIG_RESYNC_COOLDOWN_MS = 30_000
+const CONFIG_RESYNC_MAX_ATTEMPTS = 5
+const configResync = new Map<string, { attempts: number; lastAttempt: number }>()
+
+export function pushDeviceConfig(deviceMongoId: string): Promise<void> {
   if (!Types.ObjectId.isValid(deviceMongoId)) {
-    log(`Invalid device Mongo ID: ${deviceMongoId}`)
-    return
+    logConfig(`Invalid device Mongo ID: ${deviceMongoId}`)
+    return Promise.resolve()
   }
 
+  return withConfigLock(deviceMongoId, () => pushDeviceConfigLocked(deviceMongoId))
+}
+
+async function pushDeviceConfigLocked(deviceMongoId: string) {
   const device = await Device.findById(deviceMongoId).lean()
 
   if (!device) {
-    log(`Device not found: ${deviceMongoId}`)
+    logConfig(`Device not found: ${deviceMongoId}`)
     return
   }
 
   const [sensors, actuators] = await Promise.all([
-    Sensor.find({ deviceId: device._id }).lean(),
-    Actuator.find({ deviceId: device._id }).lean(),
+    Sensor.find({ deviceId: device._id }).sort({ _id: 1 }).lean(),
+    Actuator.find({ deviceId: device._id }).sort({ _id: 1 }).lean(),
   ])
 
   let automations: DeviceAutomation[] = []
@@ -223,12 +391,14 @@ export async function pushDeviceConfig(deviceMongoId: string) {
           }))
       : undefined
 
-  const config = {
-    deviceId: device.deviceId,
+  // deviceId is set AFTER the spread: a user-defined `config.deviceId` must
+  // never be able to override the device's real MQTT identity.
+  const body = {
     protocolVersion: '2.1',
     ...(device.config && typeof device.config === 'object'
       ? device.config
       : {}),
+    deviceId: device.deviceId,
     sensors: sensorConfig,
     actuators: actuatorConfig,
     automationExecutor: env.AUTOMATION_EXECUTOR,
@@ -237,15 +407,58 @@ export async function pushDeviceConfig(deviceMongoId: string) {
       : {}),
   }
 
+  const hash = createHash('sha256').update(stableStringify(body)).digest('hex')
+
+  let version = device.configVersion ?? 0
+  let changed = false
+
+  if (version < 1 || device.configHash !== hash) {
+    const bumped = await Device.findOneAndUpdate(
+      { _id: device._id },
+      {
+        $inc: { configVersion: 1 },
+        $set: { configHash: hash, configStatus: 'pending' },
+        $unset: { lastConfigError: '' },
+      },
+      { new: true },
+    ).lean()
+
+    if (!bumped) {
+      logConfig(`Device ${device.deviceId} was deleted while its config was generated`)
+      return
+    }
+
+    version = bumped.configVersion ?? 1
+    changed = true
+    configResync.delete(device.deviceId)
+  }
+
+  const config = {
+    ...body,
+    configVersion: version,
+    configHash: hash.slice(0, CONFIG_HASH_LENGTH),
+  }
+
+  // If this publish fails the DB already says configStatus='pending', and the
+  // device receives the config on its next connect / resync.
   await publishConfig(device.deviceId, config)
 
-  log(
-    `Config pushed to ${device.deviceId}: ` +
+  await Device.updateOne(
+    { _id: device._id },
+    { $set: { lastConfigPublishedAt: new Date() } },
+  )
+
+  logConfig(
+    `Published to ${device.deviceId} version=${version}` +
+      `${changed ? '' : ' (re-sent, unchanged)'}: ` +
       `${sensors.length} sensors, ` +
       `${actuators.length} actuators, ` +
       `${automations.length} automations ` +
       `(executor=${env.AUTOMATION_EXECUTOR})`,
   )
+
+  const fresh = await Device.findById(device._id).lean()
+  if (fresh) broadcastDeviceUpdate(String(fresh.userId), fresh)
 }
 
 /**
@@ -260,9 +473,158 @@ export async function pushDeviceConfigSafe(
     await pushDeviceConfig(deviceMongoId)
     return true
   } catch (error) {
-    log(`Config push failed for ${deviceMongoId}`, error)
+    logConfig(`Publish failed for ${deviceMongoId}`, error)
     return false
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Config resync + CONFIG_ACK                                                 */
+/* -------------------------------------------------------------------------- */
+
+type ConfigSyncDevice = {
+  _id: Types.ObjectId
+  deviceId: string
+  configStatus?: string | null
+}
+
+/** Device (re)connected: always hand it the latest config with a fresh retry budget. */
+async function pushConfigOnReconnect(device: ConfigSyncDevice) {
+  configResync.set(device.deviceId, { attempts: 0, lastAttempt: Date.now() })
+  await pushDeviceConfigSafe(String(device._id))
+}
+
+/** Telemetry proves the device is alive; if it never confirmed the config, re-send it. */
+async function maybeResyncConfig(device: ConfigSyncDevice) {
+  if (device.configStatus === 'acked' || device.configStatus === 'failed') return
+
+  const now = Date.now()
+  const state = configResync.get(device.deviceId) ?? { attempts: 0, lastAttempt: 0 }
+
+  if (now - state.lastAttempt < CONFIG_RESYNC_COOLDOWN_MS) return
+
+  if (state.attempts >= CONFIG_RESYNC_MAX_ATTEMPTS) {
+    if (state.attempts === CONFIG_RESYNC_MAX_ATTEMPTS) {
+      configResync.set(device.deviceId, { attempts: state.attempts + 1, lastAttempt: now })
+      logConfig(
+        `${device.deviceId} never acknowledged the config after ${CONFIG_RESYNC_MAX_ATTEMPTS} re-sends; ` +
+          'giving up until it reconnects (does the firmware send CONFIG_ACK?)',
+      )
+    }
+    return
+  }
+
+  configResync.set(device.deviceId, { attempts: state.attempts + 1, lastAttempt: now })
+  logConfig(
+    `${device.deviceId} has not acknowledged its config yet; re-sending ` +
+      `(attempt ${state.attempts + 1}/${CONFIG_RESYNC_MAX_ATTEMPTS})`,
+  )
+  await pushDeviceConfigSafe(String(device._id))
+}
+
+async function configAck(raw: unknown, topicDeviceId: string) {
+  const result = configAckSchema.safeParse(raw)
+
+  if (!result.success) {
+    log(`Invalid CONFIG_ACK payload from ${topicDeviceId}`, result.error)
+    return
+  }
+
+  const ack = result.data
+
+  if (ack.deviceId !== topicDeviceId) {
+    log(`Device ID mismatch: topic=${topicDeviceId}, payload=${ack.deviceId}`)
+    return
+  }
+
+  const device = await Device.findOne({ deviceId: topicDeviceId })
+
+  if (!device) {
+    await logUnknownDevice(topicDeviceId, 'config/ack', raw)
+    return
+  }
+
+  logRecognized(device.deviceId)
+
+  const currentVersion = device.configVersion ?? 0
+  const expectedHash = device.configHash?.slice(0, CONFIG_HASH_LENGTH)
+
+  // An ACK for an older config (published before the latest DB change) says
+  // nothing about the current one; the device will ACK the newer version too.
+  if (
+    ack.configVersion !== currentVersion ||
+    (ack.configHash && expectedHash && ack.configHash !== expectedHash)
+  ) {
+    logConfig(
+      `Stale CONFIG_ACK from ${device.deviceId}: ack version=${ack.configVersion}, ` +
+        `current version=${currentVersion}; waiting for the latest`,
+    )
+    return
+  }
+
+  const now = new Date()
+  const previousStatus = device.configStatus
+
+  if (ack.status === 'applied') {
+    // Filtering on configVersion means a newer push that happened while this
+    // ACK was processed is never marked as acknowledged by mistake.
+    await Device.updateOne(
+      { _id: device._id, configVersion: currentVersion },
+      {
+        $set: {
+          configStatus: 'acked',
+          lastConfigAckVersion: ack.configVersion,
+          lastConfigAckAt: now,
+        },
+        $unset: { lastConfigError: '' },
+      },
+    )
+
+    configResync.delete(device.deviceId)
+
+    logConfig(
+      `ACK from ${device.deviceId}: version=${ack.configVersion} applied` +
+        (ack.sensors !== undefined || ack.actuators !== undefined
+          ? ` (${ack.sensors ?? '?'} sensors, ${ack.actuators ?? '?'} actuators)`
+          : ''),
+    )
+
+    if (previousStatus !== 'acked') {
+      await createEvent({
+        userId: String(device.userId),
+        deviceId: String(device._id),
+        type: 'system',
+        message: `Config v${ack.configVersion} applied by device`,
+        metadata: { mqtt: true, configVersion: ack.configVersion },
+      })
+    }
+  } else {
+    const reason = ack.error || 'unknown error'
+
+    await Device.updateOne(
+      { _id: device._id, configVersion: currentVersion },
+      {
+        $set: {
+          configStatus: 'failed',
+          lastConfigAckAt: now,
+          lastConfigError: reason,
+        },
+      },
+    )
+
+    logConfig(`ACK from ${device.deviceId}: version=${ack.configVersion} FAILED: ${reason}`)
+
+    await createEvent({
+      userId: String(device.userId),
+      deviceId: String(device._id),
+      type: 'system',
+      message: `Device rejected config v${ack.configVersion}: ${reason}`,
+      metadata: { mqtt: true, configVersion: ack.configVersion },
+    })
+  }
+
+  const fresh = await Device.findById(device._id).lean()
+  if (fresh) broadcastDeviceUpdate(String(fresh.userId), fresh)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -343,9 +705,11 @@ async function telemetry(raw: unknown, topicDeviceId: string) {
   const device = await Device.findOne({ deviceId: topicDeviceId })
 
   if (!device) {
-    logUnknownDevice(topicDeviceId)
+    await logUnknownDevice(topicDeviceId, 'telemetry', raw)
     return
   }
+
+  logRecognized(device.deviceId)
 
   // Merge generic readings and legacy GPIO readings.
   const readings = buildReadingIndex(
@@ -459,6 +823,15 @@ async function telemetry(raw: unknown, topicDeviceId: string) {
     ...result.data,
     readings,
   })
+
+  logTelemetryReceived(device.deviceId, Object.keys(readings).length)
+
+  // Telemetry arrives but the device never confirmed its config: re-send it.
+  await maybeResyncConfig({
+    _id: device._id,
+    deviceId: device.deviceId,
+    configStatus: device.configStatus,
+  })
 }
 
 /* -------------------------------------------------------------------------- */
@@ -484,8 +857,16 @@ async function status(raw: unknown, topicDeviceId: string) {
   const device = await Device.findOne({ deviceId: topicDeviceId })
 
   if (!device) {
-    logUnknownDevice(topicDeviceId)
+    await logUnknownDevice(topicDeviceId, 'status', raw)
     return
+  }
+
+  if (result.data.status === 'online') {
+    logRecognized(device.deviceId)
+  } else {
+    // Offline (Last Will or clean disconnect): announce recognition again next time.
+    recognizedDevices.delete(device.deviceId)
+    telemetryLastLogged.delete(device.deviceId)
   }
 
   const previousStatus = device.status
@@ -532,7 +913,11 @@ async function status(raw: unknown, topicDeviceId: string) {
 
   // Device came online: push the latest hardware configuration.
   if (result.data.status === 'online') {
-    await pushDeviceConfigSafe(String(device._id))
+    await pushConfigOnReconnect({
+      _id: device._id,
+      deviceId: device.deviceId,
+      configStatus: device.configStatus,
+    })
   }
 }
 
@@ -552,7 +937,7 @@ export function startMqtt() {
     }
 
     mqttClient.subscribe(
-      [topics.telemetry, topics.status],
+      [topics.telemetry, topics.status, topics.configAck],
       { qos: 1 },
       (error) => {
         if (error) {
@@ -560,13 +945,38 @@ export function startMqtt() {
           return
         }
 
-        log('Subscribed to telemetry/status')
+        log('Subscribed to telemetry/status/config-ack')
+        void logRegisteredDevices()
       },
     )
   }
 
+  // Startup diagnostic: which ids does the backend accept? Compare with the
+  // firmware DEVICE_ID if "Unknown device message" ever shows up.
+  const logRegisteredDevices = async () => {
+    try {
+      const [total, sample] = await Promise.all([
+        Device.countDocuments(),
+        Device.find().select('deviceId').limit(20).lean(),
+      ])
+
+      log(
+        `Registered devices (${total}): ` +
+          (sample.length > 0
+            ? sample.map((device) => `"${device.deviceId}"`).join(', ')
+            : 'none') +
+          (total > sample.length ? ', ...' : ''),
+      )
+    } catch (error) {
+      log('Could not list registered devices', error)
+    }
+  }
+
   mqttClient.on('connect', () => {
     log(`Connected as ${mqttClient.options.clientId}`)
+
+    // Device state is unknown after a broker reconnect: re-announce recognition.
+    recognizedDevices.clear()
 
     // Re-subscribe every time MQTT reconnects.
     subscribe()
@@ -590,11 +1000,13 @@ export function startMqtt() {
 
   mqttClient.on('message', async (topic, message) => {
     try {
-      const kind = topic.endsWith('/telemetry')
-        ? 'telemetry'
-        : topic.endsWith('/status')
-          ? 'status'
-          : null
+      const kind: DeviceTopicKind | null = topic.endsWith('/config/ack')
+        ? 'config/ack'
+        : topic.endsWith('/telemetry')
+          ? 'telemetry'
+          : topic.endsWith('/status')
+            ? 'status'
+            : null
 
       if (!kind) return
 
@@ -619,6 +1031,11 @@ export function startMqtt() {
         return
       }
 
+      if (kind === 'config/ack') {
+        await configAck(payload, topicDeviceId)
+        return
+      }
+
       await status(payload, topicDeviceId)
     } catch (error) {
       log(`Message processing failed for ${topic}`, error)
@@ -639,6 +1056,11 @@ export async function stopMqtt() {
   if (!started) return
 
   started = false
+
+  recognizedDevices.clear()
+  telemetryLastLogged.clear()
+  unknownDeviceState.clear()
+  configResync.clear()
 
   mqttClient.removeAllListeners('connect')
   mqttClient.removeAllListeners('reconnect')
