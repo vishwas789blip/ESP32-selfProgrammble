@@ -107,7 +107,7 @@ export async function pushDeviceConfig(deviceMongoId: string) {
           value: c.value,
         })),
         actions: a.actions.map(action => ({
-          actuatorId: actuatorNameById.get(String(action.actuatorId))!,
+          actuatorId: String(action.actuatorId),
           command: String(action.command).trim(),
           ...(action.value !== undefined ? { value: action.value } : {}),
           ...(action.duration != null ? { duration: action.duration } : {}),
