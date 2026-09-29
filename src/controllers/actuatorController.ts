@@ -17,19 +17,12 @@ export const actuatorController = {
       req.body,
     )),
 
-  update: async (req: AuthRequest, res: any) => {
-    const item = await resourceServices.ownedResource(
-      Actuator,
+  update: async (req: AuthRequest, res: any) =>
+    send(res, await resourceServices.updateActuator(
       getUserId(req),
       getParam(req.params.id),
-    );
-
-    Object.assign(item, req.body);
-    const saved = await item.save();
-
-    await resourceServices.pushDeviceConfig(String(item.deviceId));
-    send(res, saved);
-  },
+      req.body,
+    )),
 
   remove: async (req: AuthRequest, res: any) => {
     const item = await resourceServices.ownedResource(

@@ -774,6 +774,7 @@ async function telemetry(raw: unknown, topicDeviceId: string) {
     sensor.value = newValue
     sensor.lastUpdated = now
     sensor.status = deriveSensorStatus(newValue)
+    sensor.healthStatus = 'healthy'
 
     await sensor.save()
 

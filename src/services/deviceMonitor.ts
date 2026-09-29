@@ -1,5 +1,6 @@
 import { env } from '../config/env.js'
 import { Device } from '../models/Device.js'
+import { Sensor } from '../models/Sensor.js'
 import { createEvent } from './eventService.js'
 import { broadcastDeviceStatus } from './realtimeService.js'
 
@@ -45,6 +46,32 @@ export async function markStaleDevicesOffline(now: Date = new Date()): Promise<n
       })
     } catch (error) {
       console.error('[MONITOR] Could not store offline event:', error instanceof Error ? error.message : error)
+    }
+  }
+
+  // Sensor freshness is tracked independently from device heartbeat. A device can
+  // still publish telemetry while one configured sensor stops reporting.
+  const sensorStaleCutoff = cutoff
+  const staleSensors = await Sensor.find({
+    healthStatus: 'healthy',
+    lastUpdated: { $lt: sensorStaleCutoff },
+  }).select('_id deviceId name lastUpdated')
+
+  if (staleSensors.length > 0) {
+    await Sensor.updateMany(
+      {
+        _id: { $in: staleSensors.map((sensor) => sensor._id) },
+        healthStatus: 'healthy',
+        lastUpdated: { $lt: sensorStaleCutoff },
+      },
+      { $set: { healthStatus: 'stale' } },
+    )
+
+    for (const sensor of staleSensors) {
+      console.log(
+        `[MONITOR] Sensor stale: ${sensor.name} (${String(sensor._id)}) ` +
+        `no telemetry for ${timeoutSec}s`,
+      )
     }
   }
 

@@ -14,6 +14,7 @@ import {
   broadcastActuatorUpdate,
   broadcastAutomationUpdate,
 } from './realtimeService.js'
+import { collectGpioIssues, type GpioFields, type GpioRole } from '../validations/gpio.js'
 
 // Other files still import `pushDeviceConfig` from here; they now get the
 // safe (never-throwing) version.
@@ -30,6 +31,94 @@ const notFound = () =>
       code: 'NOT_FOUND',
     },
   )
+
+
+const invalidGpio = (message: string) =>
+  Object.assign(new Error(message), {
+    statusCode: 400,
+    code: 'INVALID_GPIO',
+  })
+
+function gpioFields(data: Record<string, unknown>): GpioFields {
+  return {
+    type: typeof data.type === 'string' ? data.type : undefined,
+    interface: typeof data.interface === 'string' ? data.interface : undefined,
+    gpio: typeof data.gpio === 'number' ? data.gpio : undefined,
+    pins:
+      data.pins && typeof data.pins === 'object' && !Array.isArray(data.pins)
+        ? data.pins as Record<string, number>
+        : undefined,
+  }
+}
+
+function throwGpioIssues(role: GpioRole, data: Record<string, unknown>) {
+  const issues = collectGpioIssues(role, gpioFields(data))
+  if (issues.length === 0) return
+
+  throw invalidGpio(issues.map((issue) => issue.message).join('; '))
+}
+
+function gpioKeys(data: Record<string, unknown>): number[] {
+  const keys: number[] = []
+  if (typeof data.gpio === 'number') keys.push(data.gpio)
+
+  if (data.pins && typeof data.pins === 'object' && !Array.isArray(data.pins)) {
+    for (const value of Object.values(data.pins)) {
+      if (typeof value === 'number') keys.push(value)
+    }
+  }
+
+  return [...new Set(keys)]
+}
+
+async function assertGpioConflicts(
+  deviceId: string,
+  role: GpioRole,
+  data: Record<string, unknown>,
+  excludeId?: string,
+) {
+  const pins = gpioKeys(data)
+  if (pins.length === 0) return
+
+  // Sensors may share a physical data pin (for example temperature + humidity
+  // exposed by one DHT device). Actuators, however, must never share a GPIO
+  // with another resource because two drivers would fight over the same pin.
+  const [sensors, actuators] = await Promise.all([
+    Sensor.find({ deviceId }),
+    Actuator.find({ deviceId }),
+  ])
+
+  const resources = role === 'sensor' ? actuators : [...sensors, ...actuators]
+
+  for (const resource of resources) {
+    if (excludeId && String(resource._id) === excludeId) continue
+    const otherPins = gpioKeys(resource.toObject() as Record<string, unknown>)
+    const conflict = pins.find((pin) => otherPins.includes(pin))
+    if (conflict !== undefined) {
+      throw invalidGpio(
+        `GPIO ${conflict} is already used by ${role === 'sensor' ? 'actuator' : 'sensor/actuator'} '${resource.name}'`,
+      )
+    }
+  }
+}
+
+async function validateSensorGpio(
+  deviceId: string,
+  input: Record<string, unknown>,
+  excludeId?: string,
+) {
+  throwGpioIssues('sensor', input)
+  await assertGpioConflicts(deviceId, 'sensor', input, excludeId)
+}
+
+async function validateActuatorGpio(
+  deviceId: string,
+  input: Record<string, unknown>,
+  excludeId?: string,
+) {
+  throwGpioIssues('actuator', input)
+  await assertGpioConflicts(deviceId, 'actuator', input, excludeId)
+}
 
 const invalidRef = (message: string) =>
   Object.assign(
@@ -361,11 +450,14 @@ export async function createSensor(
     deviceId,
   )
 
+  await validateSensorGpio(deviceId, input)
+
   const sensor =
     await Sensor.create({
       ...input,
       deviceId: oid(deviceId),
-      lastUpdated: new Date(),
+      healthStatus: 'unknown',
+      lastUpdated: undefined,
     })
 
   await pushDeviceConfigSafe(
@@ -373,6 +465,22 @@ export async function createSensor(
   )
 
   return sensor
+}
+
+export async function updateSensor(
+  userId: string,
+  id: string,
+  input: Record<string, unknown>,
+) {
+  const sensor = await ownedResource(Sensor, userId, id)
+  const merged = { ...sensor.toObject(), ...input } as Record<string, unknown>
+
+  await validateSensorGpio(String(sensor.deviceId), merged, id)
+
+  Object.assign(sensor, input)
+  const saved = await sensor.save()
+  await pushDeviceConfigSafe(String(sensor.deviceId))
+  return saved
 }
 
 export async function listActuators(
@@ -399,6 +507,8 @@ export async function createActuator(
     deviceId,
   )
 
+  await validateActuatorGpio(deviceId, input)
+
   const actuator =
     await Actuator.create({
       ...input,
@@ -410,6 +520,22 @@ export async function createActuator(
   )
 
   return actuator
+}
+
+export async function updateActuator(
+  userId: string,
+  id: string,
+  input: Record<string, unknown>,
+) {
+  const actuator = await ownedResource(Actuator, userId, id)
+  const merged = { ...actuator.toObject(), ...input } as Record<string, unknown>
+
+  await validateActuatorGpio(String(actuator.deviceId), merged, id)
+
+  Object.assign(actuator, input)
+  const saved = await actuator.save()
+  await pushDeviceConfigSafe(String(actuator.deviceId))
+  return saved
 }
 
 export async function commandActuator(

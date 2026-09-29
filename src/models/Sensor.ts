@@ -17,6 +17,10 @@ const sensorSchema = new Schema({
   unit: { type: String, trim: true },
   config: { type: Schema.Types.Mixed, default: {} },
   status: { type: String, enum: ['normal', 'warning', 'error', 'unknown'], default: 'unknown' },
+  // Transport/data freshness is separate from the value status above.
+  // 'healthy' means telemetry for this sensor was received recently;
+  // 'stale' means the device is alive but this sensor stopped reporting.
+  healthStatus: { type: String, enum: ['healthy', 'stale', 'unknown', 'invalid'], default: 'unknown' },
   lastUpdated: Date,
 }, { timestamps: true })
 

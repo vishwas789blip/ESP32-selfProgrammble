@@ -21,19 +21,12 @@ export const sensorController = {
       getParam(req.params.id),
     )),
 
-  update: async (req: AuthRequest, res: any) => {
-    const item = await resourceServices.ownedResource(
-      Sensor,
+  update: async (req: AuthRequest, res: any) =>
+    send(res, await resourceServices.updateSensor(
       getUserId(req),
       getParam(req.params.id),
-    );
-
-    Object.assign(item, req.body);
-    const saved = await item.save();
-
-    await resourceServices.pushDeviceConfig(String(item.deviceId));
-    send(res, saved);
-  },
+      req.body,
+    )),
 
   remove: async (req: AuthRequest, res: any) => {
     const item = await resourceServices.ownedResource(
