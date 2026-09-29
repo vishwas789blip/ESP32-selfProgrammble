@@ -269,7 +269,7 @@ export const devices = {
       actuators: actuators.map(
         actuator => ({
           actuatorId:
-            actuator.name,
+            String(actuator._id),
           name: actuator.name,
           type: actuator.type,
           gpio: actuator.gpio,
@@ -487,7 +487,7 @@ export async function commandActuator(
     deviceId:
       device.deviceId,
     actuatorId:
-      actuator.name,
+      String(actuator._id),
     command:
       normalized,
   }
