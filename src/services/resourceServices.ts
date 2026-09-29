@@ -8,14 +8,16 @@ import { env } from '../config/env.js'
 import { clearRetained } from './mqttPublisher.js'
 import {
   publishCommand,
-  pushDeviceConfig,
+  pushDeviceConfigSafe,
 } from './mqttService.js'
 import {
   broadcastActuatorUpdate,
   broadcastAutomationUpdate,
 } from './realtimeService.js'
 
-export { pushDeviceConfig }
+// Other files still import `pushDeviceConfig` from here; they now get the
+// safe (never-throwing) version.
+export { pushDeviceConfigSafe as pushDeviceConfig }
 
 const oid = (id: string) =>
   new Types.ObjectId(id)
@@ -107,13 +109,13 @@ async function assertAutomationRefsBelongToDevice(
  * set now travels inside the retained config message (one mechanism, always
  * consistent), and only when the ESP32 is the executor (AUTOMATION_EXECUTOR=device).
  * In 'server' mode there is nothing to sync: the backend fires the commands itself.
- * pushDeviceConfig() is best-effort, so this never fails the API request.
+ * pushDeviceConfigSafe() is best-effort, so this never fails the API request.
  */
 async function syncDeviceAutomations(...deviceMongoIds: string[]) {
   if (env.AUTOMATION_EXECUTOR !== 'device') return
 
   for (const id of new Set(deviceMongoIds)) {
-    await pushDeviceConfig(id)
+    await pushDeviceConfigSafe(id)
   }
 }
 
@@ -298,7 +300,7 @@ export const devices = {
 
     await device.save()
 
-    await pushDeviceConfig(id)
+    await pushDeviceConfigSafe(id)
 
     return devices.getConfig(
       userId,
@@ -366,7 +368,7 @@ export async function createSensor(
       lastUpdated: new Date(),
     })
 
-  await pushDeviceConfig(
+  await pushDeviceConfigSafe(
     deviceId,
   )
 
@@ -403,7 +405,7 @@ export async function createActuator(
       deviceId: oid(deviceId),
     })
 
-  await pushDeviceConfig(
+  await pushDeviceConfigSafe(
     deviceId,
   )
 

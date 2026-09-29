@@ -10,6 +10,7 @@ const mqttUnavailable = (message: string) =>
 function rawPublish(topic: string, body: string, options: PublishOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     if (!mqttClient.connected) {
+      console.error(`[MQTT] publish skipped, broker not connected topic=${topic}`)
       reject(mqttUnavailable('MQTT broker is not connected'))
       return
     }
@@ -18,6 +19,7 @@ function rawPublish(topic: string, body: string, options: PublishOptions): Promi
     const timer = setTimeout(() => {
       if (settled) return
       settled = true
+      console.error(`[MQTT] publish timed out topic=${topic}`)
       reject(mqttUnavailable('MQTT publish timed out'))
     }, PUBLISH_TIMEOUT_MS)
 
@@ -25,7 +27,19 @@ function rawPublish(topic: string, body: string, options: PublishOptions): Promi
       if (settled) return
       settled = true
       clearTimeout(timer)
-      error ? reject(error) : resolve()
+
+      if (error) {
+        console.error(`[MQTT] publish failed topic=${topic}: ${error.message}`)
+        reject(error)
+        return
+      }
+
+      // Log commands only, so config/telemetry traffic does not flood the logs.
+      if (topic.endsWith('/command')) {
+        console.log(`[MQTT] publish acked topic=${topic} body=${body}`)
+      }
+
+      resolve()
     })
   })
 }

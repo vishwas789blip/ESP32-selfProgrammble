@@ -8,6 +8,7 @@ import { topics } from '../config/mqtt.js'
 import { env } from '../config/env.js'
 import { publishMessage } from './mqttPublisher.js'
 import { broadcastActuatorUpdate } from './realtimeService.js'
+import { commandSchema } from '../validations/mqttSchemas.js'
 import { evaluateCondition, valueThatSatisfies, NO_PREVIOUS } from './automationLogic.js'
 
 type DeviceInfo = {
@@ -105,8 +106,20 @@ async function executeAutomationActions(
 
     const label = `${actuator.name}:${command}`
 
+    // Same schema as the manual command path (publishCommand in mqttService).
+    // Imported directly from the schema file to avoid a circular import.
+    const parsed = commandSchema.safeParse(payload)
+
+    if (!parsed.success) {
+      console.error(
+        `[AUTOMATION] ${automation.name}: invalid command payload for ${label}: ${parsed.error.message}`,
+      )
+      result.failed.push(label)
+      continue
+    }
+
     try {
-      await publishMessage(topics.command(device.deviceId), payload, { qos: 1 })
+      await publishMessage(topics.command(device.deviceId), parsed.data, { qos: 1 })
     } catch (error) {
       console.error(`[AUTOMATION] ${automation.name}: publishing ${label} failed: ${errMsg(error)}`)
       result.failed.push(label)
@@ -177,6 +190,10 @@ export async function evaluateAutomations(
   })
 
   if (automations.length === 0) return
+
+  console.log(
+    `[AUTOMATION] eval sensor=${sensorId} value=${String(currentValue)} prev=${String(previousValue)} rules=${automations.length}`,
+  )
 
   for (const automation of automations) {
     try {
