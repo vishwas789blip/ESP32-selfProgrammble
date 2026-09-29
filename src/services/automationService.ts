@@ -94,7 +94,7 @@ async function executeAutomationActions(
 
     const payload = {
       type: 'actuator' as const,
-      actuatorId: actuator.name,
+      actuatorId: String(actuator._id),
       command,
       ...(action.value !== undefined ? { value: action.value } : {}),
       ...(action.duration !== undefined && action.duration !== null ? { duration: action.duration } : {}),
