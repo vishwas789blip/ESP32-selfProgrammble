@@ -13,13 +13,12 @@ const actuatorSchema = z.object({
   pins: z.record(z.string(), z.number().int().min(0).max(48)).optional(),
   address: z.union([z.number().int(), z.string()]).optional(),
   channel: z.union([z.number().int(), z.string()]).optional(),
-  state: z.unknown().optional(),
   config: z.record(z.string(), z.unknown()).optional(),
 })
 
 const commandSchema = z.object({
   command: z.string().trim().min(1).max(100),
-  value: z.union([z.boolean(), z.number().finite(), z.string(), z.null()]).optional(),
+  value: z.unknown().optional(),
   duration: z.number().int().positive().max(86400).optional(),
   parameters: z.record(z.string(), z.unknown()).optional(),
 })

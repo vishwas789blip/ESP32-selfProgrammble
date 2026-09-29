@@ -5,6 +5,7 @@ import { Actuator } from '../models/Actuator.js'
 import { Automation } from '../models/Automation.js'
 import { createEvent } from './eventService.js'
 import { env } from '../config/env.js'
+import { clearRetained } from './mqttPublisher.js'
 import {
   publishCommand,
   pushDeviceConfig,
@@ -195,21 +196,21 @@ export const devices = {
     userId: string,
     id: string,
   ) => {
-    await ownedDevice(userId, id)
+    const device = await ownedDevice(userId, id)
+
+    // Remove retained configuration before deleting the registry record. MQTT
+    // failures should not block database deletion, but they are logged clearly.
+    try {
+      await clearRetained(`devices/${device.deviceId}/config`)
+      await clearRetained(`devices/${device.deviceId}/automation`)
+    } catch (error) {
+      console.error('[MQTT] Could not clear retained device config:', error instanceof Error ? error.message : error)
+    }
 
     await Promise.all([
-      Sensor.deleteMany({
-        deviceId: id,
-      }),
-
-      Actuator.deleteMany({
-        deviceId: id,
-      }),
-
-      Automation.deleteMany({
-        deviceId: id,
-      }),
-
+      Sensor.deleteMany({ deviceId: id }),
+      Actuator.deleteMany({ deviceId: id }),
+      Automation.deleteMany({ deviceId: id }),
       Device.findByIdAndDelete(id),
     ])
 

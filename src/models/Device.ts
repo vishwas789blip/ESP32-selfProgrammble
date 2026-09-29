@@ -2,59 +2,30 @@ import { Schema, model } from 'mongoose'
 
 const deviceSchema = new Schema(
   {
-    userId: {
-      type: Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
-      index: true,
-    },
-
-    name: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-
-    deviceId: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-
-    description: String,
-
-    status: {
-      type: String,
-      enum: ['online', 'offline'],
-      default: 'offline',
-    },
-
-    connectionType: {
-      type: String,
-      enum: ['wifi', 'bluetooth', 'mqtt'],
-      required: true,
-    },
-
+    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    name: { type: String, required: true, trim: true },
+    // MQTT topic identity. This must be globally unique because incoming MQTT
+    // packets contain only the deviceId, not the application userId.
+    deviceId: { type: String, required: true, trim: true, index: true },
+    description: { type: String, trim: true },
+    status: { type: String, enum: ['online', 'offline'], default: 'offline' },
+    connectionType: { type: String, enum: ['wifi', 'bluetooth', 'mqtt'], required: true },
     ipAddress: String,
     macAddress: String,
     firmwareVersion: String,
     lastSeen: Date,
-
-    // Arbitrary device-level settings pushed to the ESP32 over the MQTT
-    // config topic (e.g. buzzerDuration). Sensor/actuator gpio wiring is
-    // NOT stored here — it's always derived live from the Sensor/Actuator
-    // collections so it can never go stale.
     config: { type: Schema.Types.Mixed, default: {} },
     metadata: { type: Schema.Types.Mixed, default: {} },
   },
-  { timestamps: true }
+  { timestamps: true },
 )
 
-// Same device ID allowed for different users,
-// but not twice for the same user.
-deviceSchema.index(
-  { userId: 1, deviceId: 1 },
-  { unique: true }
-)
+// Do not scope uniqueness by user: MQTT messages cannot safely be resolved to a
+// user when two users have the same deviceId.
+deviceSchema.index({ deviceId: 1 }, { unique: true })
+
+deviceSchema.index({ userId: 1, createdAt: -1 })
+
+deviceSchema.index({ status: 1, lastSeen: 1 })
 
 export const Device = model('Device', deviceSchema)

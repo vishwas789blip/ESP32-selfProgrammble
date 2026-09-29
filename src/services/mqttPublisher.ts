@@ -8,9 +8,7 @@ const mqttUnavailable = (message: string) =>
   Object.assign(new Error(message), { statusCode: 503, code: 'MQTT_UNAVAILABLE' })
 
 function rawPublish(topic: string, body: string, options: PublishOptions): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    // mqtt.js would otherwise queue the packet and the QoS1 callback would not fire
-    // until the broker is back, hanging the HTTP request / telemetry handler.
+  return new Promise((resolve, reject) => {
     if (!mqttClient.connected) {
       reject(mqttUnavailable('MQTT broker is not connected'))
       return
@@ -27,18 +25,15 @@ function rawPublish(topic: string, body: string, options: PublishOptions): Promi
       if (settled) return
       settled = true
       clearTimeout(timer)
-      if (error) reject(error)
-      else resolve()
+      error ? reject(error) : resolve()
     })
   })
 }
 
-/** Single publish path for the whole backend (connected check + timeout + 503 errors). */
-export function publishMessage(topic: string, payload: unknown, options: PublishOptions = {}): Promise<void> {
+export function publishMessage(topic: string, payload: unknown, options: PublishOptions = {}) {
   return rawPublish(topic, JSON.stringify(payload), options)
 }
 
-/** An empty retained payload removes the retained message from the broker. */
-export function clearRetained(topic: string): Promise<void> {
+export function clearRetained(topic: string) {
   return rawPublish(topic, '', { qos: 1, retain: true })
 }

@@ -20,6 +20,7 @@ const sensorSchema = new Schema({
   lastUpdated: Date,
 }, { timestamps: true })
 
-sensorSchema.index({ deviceId: 1, name: 1 })
+sensorSchema.index({ deviceId: 1, name: 1 }, { unique: true })
+sensorSchema.index({ deviceId: 1, lastUpdated: -1 })
 
 export const Sensor = model('Sensor', sensorSchema)

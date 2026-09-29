@@ -13,9 +13,7 @@ const sensorSchema = z.object({
   pins: z.record(z.string(), z.number().int().min(0).max(48)).optional(),
   address: z.union([z.number().int(), z.string()]).optional(),
   channel: z.union([z.number().int(), z.string()]).optional(),
-  value: z.unknown().optional(),
   unit: z.string().trim().max(50).optional(),
-  status: z.enum(['normal', 'warning', 'error', 'unknown']).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
 })
 

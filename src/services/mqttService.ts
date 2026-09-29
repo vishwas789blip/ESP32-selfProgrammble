@@ -1,4 +1,6 @@
-import { mqttClient, topics } from '../config/mqtt.js'
+import { Types } from 'mongoose'
+import { mqttClient, topics, deviceIdFromTopic } from '../config/mqtt.js'
+import { env } from '../config/env.js'
 import { Device } from '../models/Device.js'
 import { Sensor } from '../models/Sensor.js'
 import { Actuator } from '../models/Actuator.js'
@@ -17,6 +19,7 @@ import {
   broadcastSensorUpdate,
   broadcastActuatorUpdate,
 } from './realtimeService.js'
+import { publishMessage } from './mqttPublisher.js'
 
 const log = (message: string, error?: unknown) =>
   console[error ? 'error' : 'log'](
@@ -24,269 +27,1236 @@ const log = (message: string, error?: unknown) =>
     error instanceof Error ? error.message : '',
   )
 
-function publish(topic: string, payload: unknown, options: { qos?: 0 | 1 | 2; retain?: boolean } = {}) {
-  return new Promise<void>((resolve, reject) => {
-    if (!mqttClient.connected) {
-      reject(new Error('MQTT broker is not connected'))
-      return
-    }
-    mqttClient.publish(topic, JSON.stringify(payload), { qos: 1, ...options }, error => {
-      if (error) reject(error)
-      else resolve()
-    })
-  })
+let started = false
+
+/*
+|--------------------------------------------------------------------------
+| Local types
+|--------------------------------------------------------------------------
+|
+| These types prevent implicit `any` errors when using .lean() results.
+| They also make the MQTT config generation explicit and easier to maintain.
+|
+*/
+
+type AutomationCondition = {
+  sensorId: Types.ObjectId
+  operator: string
+  value: unknown
 }
 
-export function publishCommand(deviceId: string, input: unknown): Promise<void> {
+type AutomationAction = {
+  actuatorId: Types.ObjectId
+  command: string
+  value?: unknown
+  duration?: number
+  parameters?: Record<string, unknown>
+}
+
+type DeviceAutomation = {
+  _id: Types.ObjectId
+  name: string
+  enabled: boolean
+  conditions: AutomationCondition[]
+  actions: AutomationAction[]
+}
+
+type DeviceLike = {
+  _id: Types.ObjectId
+  deviceId: string
+  userId: Types.ObjectId
+}
+
+/*
+|--------------------------------------------------------------------------
+| MQTT Publish helpers
+|--------------------------------------------------------------------------
+*/
+
+export function publishCommand(deviceId: string, input: unknown) {
   const payload = commandSchema.parse(input)
-  return publish(topics.command(deviceId), payload, { qos: 1 })
+
+  return publishMessage(
+    topics.command(deviceId),
+    payload,
+    { qos: 1 },
+  )
 }
 
-export function publishAutomation(deviceId: string, automation: unknown): Promise<void> {
-  return publish(topics.automation(deviceId), automation, { qos: 1, retain: true })
+export function publishAutomation(
+  deviceId: string,
+  automation: unknown,
+) {
+  return publishMessage(
+    topics.automation(deviceId),
+    automation,
+    {
+      qos: 1,
+      retain: true,
+    },
+  )
 }
 
-export function publishConfig(deviceId: string, input: unknown): Promise<void> {
+export function publishConfig(
+  deviceId: string,
+  input: unknown,
+) {
   const payload = configSchema.parse(input)
-  return publish(topics.config(deviceId), payload, { qos: 1, retain: true })
+
+  return publishMessage(
+    topics.config(deviceId),
+    payload,
+    {
+      qos: 1,
+      retain: true,
+    },
+  )
 }
 
-/**
- * Build a complete hardware-independent configuration.
- * GPIO is optional; buses such as I2C/SPI/UART/OneWire and virtual sensors
- * are represented through interface/pins/address/config.
- */
-export async function pushDeviceConfig(deviceMongoId: string) {
-  const device = await Device.findById(deviceMongoId)
-  if (!device) return
+/*
+|--------------------------------------------------------------------------
+| Device configuration
+|--------------------------------------------------------------------------
+|
+| Important:
+|
+| AUTOMATION_EXECUTOR=server
+|   -> Backend evaluates automation.
+|   -> Automation rules are NOT sent to ESP32.
+|
+| AUTOMATION_EXECUTOR=device
+|   -> ESP32 evaluates automation.
+|   -> Complete enabled automation list is sent in config.
+|
+| This prevents the same automation from executing twice.
+|
+*/
 
-  const [sensors, actuators, automations] = await Promise.all([
-    Sensor.find({ deviceId: deviceMongoId }).lean(),
-    Actuator.find({ deviceId: deviceMongoId }).lean(),
-    Automation.find({ deviceId: deviceMongoId, enabled: true }).lean(),
+export async function pushDeviceConfig(
+  deviceMongoId: string,
+) {
+  if (!Types.ObjectId.isValid(deviceMongoId)) {
+    log(`Invalid device Mongo ID: ${deviceMongoId}`)
+    return
+  }
+
+  const device = await Device.findById(deviceMongoId).lean()
+
+  if (!device) {
+    log(`Device not found: ${deviceMongoId}`)
+    return
+  }
+
+  const [sensors, actuators] = await Promise.all([
+    Sensor.find({
+      deviceId: device._id,
+    }).lean(),
+
+    Actuator.find({
+      deviceId: device._id,
+    }).lean(),
   ])
 
-  const actuatorNameById = new Map(
-    actuators.map(a => [String(a._id), a.name]),
-  )
+  let automations: DeviceAutomation[] = []
+
+  /*
+  |--------------------------------------------------------------------------
+  | Device-side automation
+  |--------------------------------------------------------------------------
+  */
+
+  if (env.AUTOMATION_EXECUTOR === 'device') {
+    const databaseAutomations = await Automation.find({
+      deviceId: device._id,
+      enabled: true,
+    }).lean()
+
+    /*
+    * Explicit type assertion is used here because Mongoose Mixed fields
+    * can otherwise cause callback parameters to become implicit `any`.
+    */
+    automations =
+      databaseAutomations as unknown as DeviceAutomation[]
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Sensor configuration
+  |--------------------------------------------------------------------------
+  */
+
+  const sensorConfig = sensors.map((sensor) => ({
+    sensorId: String(sensor._id),
+
+    name: sensor.name,
+
+    type: sensor.type,
+
+    interface: sensor.interface || 'gpio',
+
+    ...(sensor.gpio !== undefined
+      ? {
+          gpio: sensor.gpio,
+        }
+      : {}),
+
+    ...(sensor.pins &&
+    typeof sensor.pins === 'object'
+      ? {
+          pins: sensor.pins,
+        }
+      : {}),
+
+    ...(sensor.address !== undefined
+      ? {
+          address: sensor.address,
+        }
+      : {}),
+
+    ...(sensor.channel !== undefined
+      ? {
+          channel: sensor.channel,
+        }
+      : {}),
+
+    ...(sensor.unit
+      ? {
+          unit: sensor.unit,
+        }
+      : {}),
+
+    ...(sensor.config &&
+    typeof sensor.config === 'object'
+      ? {
+          config: sensor.config,
+        }
+      : {}),
+  }))
+
+  /*
+  |--------------------------------------------------------------------------
+  | Actuator configuration
+  |--------------------------------------------------------------------------
+  */
+
+  const actuatorConfig = actuators.map((actuator) => ({
+    actuatorId: String(actuator._id),
+
+    name: actuator.name,
+
+    type: actuator.type,
+
+    interface: actuator.interface || 'gpio',
+
+    ...(actuator.gpio !== undefined
+      ? {
+          gpio: actuator.gpio,
+        }
+      : {}),
+
+    ...(actuator.pins &&
+    typeof actuator.pins === 'object'
+      ? {
+          pins: actuator.pins,
+        }
+      : {}),
+
+    ...(actuator.address !== undefined
+      ? {
+          address: actuator.address,
+        }
+      : {}),
+
+    ...(actuator.channel !== undefined
+      ? {
+          channel: actuator.channel,
+        }
+      : {}),
+
+    ...(actuator.config &&
+    typeof actuator.config === 'object'
+      ? {
+          config: actuator.config,
+        }
+      : {}),
+  }))
+
+  /*
+  |--------------------------------------------------------------------------
+  | Device-side automation configuration
+  |--------------------------------------------------------------------------
+  */
+
+  const deviceAutomations =
+    env.AUTOMATION_EXECUTOR === 'device'
+      ? automations
+          /*
+           * Only send rules that have valid sensor/action references.
+           *
+           * Explicit parameter types fix:
+           * TS7006 Parameter 'c' implicitly has an 'any' type
+           * TS7006 Parameter 'a' implicitly has an 'any' type
+           * TS7006 Parameter 'action' implicitly has an 'any' type
+           */
+          .filter(
+            (
+              automation: DeviceAutomation,
+            ) =>
+              automation.conditions.every(
+                (
+                  condition: AutomationCondition,
+                ) => Boolean(condition.sensorId),
+              ) &&
+              automation.actions.every(
+                (
+                  action: AutomationAction,
+                ) => Boolean(action.actuatorId),
+              ),
+          )
+          .map(
+            (
+              automation: DeviceAutomation,
+            ) => ({
+              automationId: String(
+                automation._id,
+              ),
+
+              name: automation.name,
+
+              enabled: automation.enabled,
+
+              conditions:
+                automation.conditions.map(
+                  (
+                    condition: AutomationCondition,
+                  ) => ({
+                    sensorId: String(
+                      condition.sensorId,
+                    ),
+
+                    operator:
+                      condition.operator,
+
+                    value:
+                      condition.value,
+                  }),
+                ),
+
+              actions:
+                automation.actions.map(
+                  (
+                    action: AutomationAction,
+                  ) => ({
+                    actuatorId: String(
+                      action.actuatorId,
+                    ),
+
+                    command:
+                      String(
+                        action.command,
+                      ).trim(),
+
+                    ...(action.value !== undefined
+                      ? {
+                          value:
+                            action.value,
+                        }
+                      : {}),
+
+                    ...(action.duration != null
+                      ? {
+                          duration:
+                            action.duration,
+                        }
+                      : {}),
+
+                    ...(action.parameters
+                      ? {
+                          parameters:
+                            action.parameters,
+                        }
+                      : {}),
+                  }),
+                ),
+            }),
+          )
+      : undefined
+
+  /*
+  |--------------------------------------------------------------------------
+  | Final device config
+  |--------------------------------------------------------------------------
+  */
 
   const config = {
     deviceId: device.deviceId,
-    protocolVersion: '2.0',
-    ...(device.config && typeof device.config === 'object' ? device.config : {}),
-    sensors: sensors.map(sensor => ({
-      sensorId: String(sensor._id),
-      name: sensor.name,
-      type: sensor.type,
-      interface: sensor.interface || 'gpio',
-      ...(sensor.gpio !== undefined ? { gpio: sensor.gpio } : {}),
-      ...(sensor.pins && typeof sensor.pins === 'object' ? { pins: sensor.pins } : {}),
-      ...(sensor.address !== undefined ? { address: sensor.address } : {}),
-      ...(sensor.unit ? { unit: sensor.unit } : {}),
-      ...(sensor.config && typeof sensor.config === 'object' ? { config: sensor.config } : {}),
-    })),
-    actuators: actuators.map(actuator => ({
-      actuatorId: String(actuator._id),
-      name: actuator.name,
-      type: actuator.type,
-      interface: actuator.interface || 'gpio',
-      ...(actuator.gpio !== undefined ? { gpio: actuator.gpio } : {}),
-      ...(actuator.pins && typeof actuator.pins === 'object' ? { pins: actuator.pins } : {}),
-      ...(actuator.address !== undefined ? { address: actuator.address } : {}),
-      ...(actuator.config && typeof actuator.config === 'object' ? { config: actuator.config } : {}),
-    })),
-    automations: automations
-      .filter(a => a.conditions.every(c => c.sensorId) && a.actions.every(a => a.actuatorId && actuatorNameById.has(String(a.actuatorId))))
-      .map(a => ({
-        automationId: String(a._id),
-        name: a.name,
-        enabled: a.enabled,
-        conditions: a.conditions.map(c => ({
-          sensorId: String(c.sensorId),
-          operator: c.operator,
-          value: c.value,
-        })),
-        actions: a.actions.map(action => ({
-          actuatorId: String(action.actuatorId),
-          command: String(action.command).trim(),
-          ...(action.value !== undefined ? { value: action.value } : {}),
-          ...(action.duration != null ? { duration: action.duration } : {}),
-          ...(action.parameters ? { parameters: action.parameters } : {}),
-        })),
-      })),
+
+    protocolVersion: '2.1',
+
+    ...(device.config &&
+    typeof device.config === 'object'
+      ? device.config
+      : {}),
+
+    sensors: sensorConfig,
+
+    actuators: actuatorConfig,
+
+    automationExecutor:
+      env.AUTOMATION_EXECUTOR,
+
+    ...(env.AUTOMATION_EXECUTOR === 'device'
+      ? {
+          automations:
+            deviceAutomations ?? [],
+        }
+      : {}),
   }
 
-  try {
-    await publishConfig(device.deviceId, config)
-    log(`Config pushed to ${device.deviceId}: ${sensors.length} sensors, ${actuators.length} actuators, ${automations.length} automations`)
-  } catch (error) {
-    log(`Failed to push device config to ${device.deviceId}`, error)
-    throw error
-  }
+  /*
+  |--------------------------------------------------------------------------
+  | Publish retained config
+  |--------------------------------------------------------------------------
+  */
+
+  await publishConfig(
+    device.deviceId,
+    config,
+  )
+
+  log(
+    `Config pushed to ${device.deviceId}: ` +
+    `${sensors.length} sensors, ` +
+    `${actuators.length} actuators, ` +
+    `${automations.length} automations ` +
+    `(executor=${env.AUTOMATION_EXECUTOR})`,
+  )
 }
 
-function deriveSensorStatus(value: unknown): 'normal' | 'warning' | 'error' | 'unknown' {
-  if (value === null || value === undefined) return 'unknown'
-  // Boolean sensors commonly use true as an active/alarm state. Keep this
-  // behaviour for compatibility, while numeric/string sensors remain normal.
-  if (typeof value === 'boolean') return value ? 'warning' : 'normal'
+/*
+|--------------------------------------------------------------------------
+| Sensor status
+|--------------------------------------------------------------------------
+*/
+
+function deriveSensorStatus(
+  value: unknown,
+): 'normal' | 'warning' | 'error' | 'unknown' {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return 'unknown'
+  }
+
+  if (typeof value === 'boolean') {
+    return value
+      ? 'warning'
+      : 'normal'
+  }
+
   return 'normal'
 }
+
+/*
+|--------------------------------------------------------------------------
+| Reading normalization
+|--------------------------------------------------------------------------
+*/
 
 function buildReadingIndex(
   readings: Record<string, unknown>,
   gpioReadings: Record<string, unknown>,
 ) {
-  return { ...gpioReadings, ...readings }
+  return {
+    ...gpioReadings,
+    ...readings,
+  }
 }
 
-async function applyActuatorStates(device: any, states: Record<string, unknown>) {
-  for (const [identifier, state] of Object.entries(states)) {
-    const actuator = await Actuator.findOne({
-      deviceId: device._id,
-      $or: [{ name: identifier }, ...(identifier.match(/^[a-f\d]{24}$/i) ? [{ _id: identifier }] : [])],
-    })
-    if (!actuator) continue
+/*
+|--------------------------------------------------------------------------
+| Actuator state acknowledgement
+|--------------------------------------------------------------------------
+*/
+
+async function applyActuatorStates(
+  device: DeviceLike,
+  states: Record<string, unknown>,
+) {
+  for (
+    const [identifier, state]
+    of Object.entries(states)
+  ) {
+    const query: Record<string, unknown>[] = [
+      {
+        name: identifier,
+      },
+    ]
+
+    if (
+      /^[a-f\d]{24}$/i.test(
+        identifier,
+      )
+    ) {
+      query.push({
+        _id: identifier,
+      })
+    }
+
+    const actuator =
+      await Actuator.findOne({
+        deviceId: device._id,
+        $or: query,
+      })
+
+    if (!actuator) {
+      log(
+        `Actuator state received for unknown actuator: ${identifier}`,
+      )
+      continue
+    }
 
     actuator.state = state
+
     await actuator.save()
-    broadcastActuatorUpdate(String(device.userId), actuator.toObject())
+
+    broadcastActuatorUpdate(
+      String(device.userId),
+      actuator.toObject(),
+    )
   }
 }
 
-async function telemetry(raw: unknown) {
-  const result = telemetrySchema.safeParse(raw)
-  if (!result.success) return log('Invalid telemetry payload', result.error)
+/*
+|--------------------------------------------------------------------------
+| Telemetry
+|--------------------------------------------------------------------------
+*/
 
-  const device = await Device.findOne({ deviceId: result.data.deviceId })
-  if (!device) return log(`Unknown device message: ${result.data.deviceId}`)
+async function telemetry(
+  raw: unknown,
+  topicDeviceId: string,
+) {
+  const result =
+    telemetrySchema.safeParse(raw)
 
-  const readings: Record<string, any> = buildReadingIndex(
-    result.data.readings || {},
-    result.data.gpioReadings || {},
-  )
+  if (!result.success) {
+    log(
+      `Invalid telemetry payload from ${topicDeviceId}`,
+      result.error,
+    )
 
-  // Backward compatibility for the original PIR firmware.
-  if (typeof result.data.pirState === 'boolean') {
-    const pir = await Sensor.findOne({ deviceId: device._id, type: { $in: ['pir', 'motion'] } })
-    if (pir) readings[String(pir._id)] = result.data.pirState
+    return
   }
 
-  const sensors = await Sensor.find({ deviceId: device._id })
-  const now = new Date()
+  /*
+   * Never trust a payload deviceId that doesn't match the MQTT topic.
+   */
+  if (
+    result.data.deviceId !==
+    topicDeviceId
+  ) {
+    log(
+      `Device ID mismatch: topic=${topicDeviceId}, payload=${result.data.deviceId}`,
+    )
 
-  for (const sensor of sensors) {
-    const id = String(sensor._id)
-    const gpio = sensor.gpio != null ? String(sensor.gpio) : null
-    const type = String(sensor.type || '').toLowerCase()
-    const unit = String(sensor.unit || '').toLowerCase()
+    return
+  }
 
-    // Preferred: sensor Mongo ID. This removes GPIO as the identity of a sensor.
-    let key: string | null = id in readings ? id : null
+  /*
+   * deviceId is globally unique because it is the MQTT identity.
+   */
+  const device =
+    await Device.findOne({
+      deviceId: topicDeviceId,
+    })
 
-    // Backward-compatible aliases for common multi-value DHT payloads.
-    if (!key && gpio && type.includes('temp')) key = `${gpio}_temperature` in readings ? `${gpio}_temperature` : null
-    if (!key && gpio && (type.includes('humid') || unit === '%')) key = `${gpio}_humidity` in readings ? `${gpio}_humidity` : null
+  if (!device) {
+    log(
+      `Unknown device message: ${topicDeviceId}`,
+    )
 
-    // Generic physical GPIO fallback.
-    if (!key && gpio && gpio in readings) key = gpio
+    return
+  }
 
-    if (!key) continue
+  /*
+   * Merge the generic readings and legacy GPIO readings.
+   */
+  const readings =
+    buildReadingIndex(
+      result.data.readings || {},
+      result.data.gpioReadings || {},
+    )
 
-    const previousValue = sensor.value
-    const newValue = readings[key]
-    sensor.value = newValue
-    sensor.lastUpdated = now
-    sensor.status = deriveSensorStatus(newValue)
+  /*
+   * Backward compatibility for existing PIR firmware.
+   */
+  if (
+    typeof result.data.pirState ===
+    'boolean'
+  ) {
+    const pir =
+      await Sensor.findOne({
+        deviceId: device._id,
+        type: {
+          $in: [
+            'pir',
+            'motion',
+          ],
+        },
+      })
+
+    if (pir) {
+      readings[
+        String(pir._id)
+      ] =
+        result.data.pirState
+    }
+  }
+
+  const sensors =
+    await Sensor.find({
+      deviceId: device._id,
+    })
+
+  const now =
+    new Date()
+
+  /*
+   |--------------------------------------------------------------------------
+   | Process every registered sensor
+   |--------------------------------------------------------------------------
+   */
+
+  for (
+    const sensor of sensors
+  ) {
+    const id =
+      String(sensor._id)
+
+    const gpio =
+      sensor.gpio != null
+        ? String(sensor.gpio)
+        : null
+
+    const type =
+      String(
+        sensor.type || '',
+      ).toLowerCase()
+
+    const unit =
+      String(
+        sensor.unit || '',
+      ).toLowerCase()
+
+    let key:
+      string | null =
+      id in readings
+        ? id
+        : null
+
+    /*
+     * Temperature fallback.
+     */
+    if (
+      !key &&
+      gpio &&
+      type.includes('temp')
+    ) {
+      const candidate =
+        `${gpio}_temperature`
+
+      if (
+        candidate in readings
+      ) {
+        key = candidate
+      }
+    }
+
+    /*
+     * Humidity fallback.
+     */
+    if (
+      !key &&
+      gpio &&
+      (
+        type.includes('humid') ||
+        unit === '%'
+      )
+    ) {
+      const candidate =
+        `${gpio}_humidity`
+
+      if (
+        candidate in readings
+      ) {
+        key = candidate
+      }
+    }
+
+    /*
+     * GPIO fallback.
+     */
+    if (
+      !key &&
+      gpio &&
+      gpio in readings
+    ) {
+      key = gpio
+    }
+
+    if (!key) {
+      continue
+    }
+
+    const previousValue =
+      sensor.value
+
+    const newValue =
+      readings[key]
+
+    /*
+     * Update runtime telemetry state.
+     */
+    sensor.value =
+      newValue
+
+    sensor.lastUpdated =
+      now
+
+    sensor.status =
+      deriveSensorStatus(
+        newValue,
+      )
+
     await sensor.save()
 
-    broadcastSensorUpdate(String(device.userId), sensor.toObject())
-    await evaluateAutomations(
-      { _id: device._id, deviceId: device.deviceId, userId: device.userId },
-      id,
-      newValue,
-      previousValue,
+    /*
+     * Realtime frontend update.
+     */
+    broadcastSensorUpdate(
+      String(device.userId),
+      sensor.toObject(),
+    )
+
+    /*
+     * Server-side automation.
+     *
+     * IMPORTANT:
+     * If executor=device, backend must NOT evaluate.
+     */
+    if (
+      env.AUTOMATION_EXECUTOR ===
+      'server'
+    ) {
+      await evaluateAutomations(
+        {
+          _id: device._id,
+          deviceId:
+            device.deviceId,
+          userId:
+            device.userId,
+        },
+        id,
+        newValue,
+        previousValue,
+      )
+    }
+  }
+
+  /*
+   |--------------------------------------------------------------------------
+   | Actuator acknowledgement
+   |--------------------------------------------------------------------------
+   */
+
+  if (
+    result.data.actuatorStates
+  ) {
+    await applyActuatorStates(
+      {
+        _id: device._id,
+        deviceId:
+          device.deviceId,
+        userId:
+          device.userId,
+      },
+      result.data.actuatorStates,
     )
   }
 
-  if (result.data.actuatorStates) {
-    await applyActuatorStates(device, result.data.actuatorStates)
+  /*
+   |--------------------------------------------------------------------------
+   | Device heartbeat
+   |--------------------------------------------------------------------------
+   */
+
+  await Device.updateOne(
+    {
+      _id: device._id,
+    },
+    {
+      $set: {
+        lastSeen: now,
+        status: 'online',
+
+        ...(result.data.metadata
+          ? {
+              metadata:
+                result.data.metadata,
+            }
+          : {}),
+      },
+    },
+  )
+
+  /*
+   |--------------------------------------------------------------------------
+   | Realtime telemetry
+   |--------------------------------------------------------------------------
+   */
+
+  broadcastDeviceTelemetry(
+    String(device.userId),
+    device.deviceId,
+    {
+      ...result.data,
+      readings,
+    },
+  )
+}
+
+/*
+|--------------------------------------------------------------------------
+| Device status
+|--------------------------------------------------------------------------
+*/
+
+async function status(
+  raw: unknown,
+  topicDeviceId: string,
+) {
+  const result =
+    statusSchema.safeParse(raw)
+
+  if (!result.success) {
+    log(
+      `Invalid status payload from ${topicDeviceId}`,
+      result.error,
+    )
+
+    return
   }
 
-  await Device.updateOne({ _id: device._id }, {
-    $set: {
-      lastSeen: now,
-      status: 'online',
-      ...(result.data.metadata ? { metadata: result.data.metadata } : {}),
-    },
-  })
+  /*
+   * Topic identity must match payload identity.
+   */
+  if (
+    result.data.deviceId !==
+    topicDeviceId
+  ) {
+    log(
+      `Device ID mismatch: topic=${topicDeviceId}, payload=${result.data.deviceId}`,
+    )
 
-  broadcastDeviceTelemetry(String(device.userId), device.deviceId, {
-    ...result.data,
-    readings,
-  })
+    return
+  }
+
+  const device =
+    await Device.findOne({
+      deviceId: topicDeviceId,
+    })
+
+  if (!device) {
+    log(
+      `Unknown device message: ${topicDeviceId}`,
+    )
+
+    return
+  }
+
+  const previousStatus =
+    device.status
+
+  const now =
+    new Date()
+
+  await Device.updateOne(
+    {
+      _id: device._id,
+    },
+    {
+      $set: {
+        status:
+          result.data.status,
+
+        lastSeen: now,
+
+        ...(result.data.firmwareVersion
+          ? {
+              firmwareVersion:
+                result.data
+                  .firmwareVersion,
+            }
+          : {}),
+
+        ...(result.data.ipAddress
+          ? {
+              ipAddress:
+                result.data.ipAddress,
+            }
+          : {}),
+
+        ...(result.data.macAddress
+          ? {
+              macAddress:
+                result.data.macAddress,
+            }
+          : {}),
+
+        ...(result.data.metadata
+          ? {
+              metadata:
+                result.data.metadata,
+            }
+          : {}),
+      },
+    },
+  )
+
+  /*
+   |--------------------------------------------------------------------------
+   | Realtime device status
+   |--------------------------------------------------------------------------
+   */
+
+  broadcastDeviceStatus(
+    String(device.userId),
+    device.deviceId,
+    result.data.status,
+    {
+      firmwareVersion:
+        result.data
+          .firmwareVersion,
+
+      ipAddress:
+        result.data.ipAddress,
+
+      macAddress:
+        result.data.macAddress,
+    },
+  )
+
+  /*
+   |--------------------------------------------------------------------------
+   | Status event
+   |--------------------------------------------------------------------------
+   */
+
+  if (
+    previousStatus !==
+    result.data.status
+  ) {
+    await createEvent({
+      userId:
+        String(device.userId),
+
+      deviceId:
+        String(device._id),
+
+      type: 'system',
+
+      message:
+        `Device ${result.data.status}`,
+
+      metadata: {
+        mqtt: true,
+      },
+    })
+  }
+
+  /*
+   |--------------------------------------------------------------------------
+   | Device came online
+   |--------------------------------------------------------------------------
+   |
+   | Push latest hardware configuration.
+   |
+   */
+
+  if (
+    result.data.status ===
+    'online'
+  ) {
+    try {
+      await pushDeviceConfig(
+        String(device._id),
+      )
+    } catch (error) {
+      log(
+        `Could not push config after ${device.deviceId} came online`,
+        error,
+      )
+    }
+  }
 }
 
-async function status(raw: unknown) {
-  const result = statusSchema.safeParse(raw)
-  if (!result.success) return log('Invalid status payload', result.error)
-
-  const device = await Device.findOne({ deviceId: result.data.deviceId })
-  if (!device) return log(`Unknown device message: ${result.data.deviceId}`)
-
-  await Device.updateOne({ _id: device._id }, {
-    $set: {
-      status: result.data.status,
-      lastSeen: new Date(),
-      ...(result.data.firmwareVersion ? { firmwareVersion: result.data.firmwareVersion } : {}),
-      ...(result.data.ipAddress ? { ipAddress: result.data.ipAddress } : {}),
-      ...(result.data.macAddress ? { macAddress: result.data.macAddress } : {}),
-      ...(result.data.metadata ? { metadata: result.data.metadata } : {}),
-    },
-  })
-
-  broadcastDeviceStatus(String(device.userId), device.deviceId, result.data.status, {
-    firmwareVersion: result.data.firmwareVersion,
-    ipAddress: result.data.ipAddress,
-    macAddress: result.data.macAddress,
-  })
-
-  await createEvent({
-    userId: String(device.userId),
-    deviceId: String(device._id),
-    type: 'system',
-    message: `Device ${result.data.status}`,
-    metadata: { mqtt: true },
-  })
-
-  if (result.data.status === 'online') await pushDeviceConfig(String(device._id))
-}
+/*
+|--------------------------------------------------------------------------
+| MQTT startup
+|--------------------------------------------------------------------------
+*/
 
 export function startMqtt() {
-  mqttClient.on('connect', () => {
-    log('Connected')
-    mqttClient.subscribe([topics.telemetry, topics.status], { qos: 1 }, error => {
-      if (error) log('Subscribe error', error)
-      else log('Subscribed')
-    })
-  })
-  mqttClient.on('reconnect', () => log('Connecting...'))
-  mqttClient.on('error', error => log('Connection error', error))
-  mqttClient.on('offline', () => log('Offline'))
-  mqttClient.on('message', async (topic, message) => {
-    try {
-      const payload = JSON.parse(message.toString())
-      if (topic.endsWith('/telemetry')) await telemetry(payload)
-      else if (topic.endsWith('/status')) await status(payload)
-    } catch (error) {
-      log(`Message processing failed for ${topic}`, error)
+  if (started) {
+    return
+  }
+
+  started = true
+
+  /*
+   |--------------------------------------------------------------------------
+   | Subscription
+   |--------------------------------------------------------------------------
+   */
+
+  const subscribe = () => {
+    if (!mqttClient.connected) {
+      log(
+        'Cannot subscribe because MQTT is not connected',
+      )
+
+      return
     }
-  })
+
+    mqttClient.subscribe(
+      [
+        topics.telemetry,
+        topics.status,
+      ],
+      {
+        qos: 1,
+      },
+      (error) => {
+        if (error) {
+          log(
+            'Subscribe error',
+            error,
+          )
+
+          return
+        }
+
+        log(
+          'Subscribed to telemetry/status',
+        )
+      },
+    )
+  }
+
+  /*
+   |--------------------------------------------------------------------------
+   | MQTT events
+   |--------------------------------------------------------------------------
+   */
+
+  mqttClient.on(
+    'connect',
+    () => {
+      log(
+        `Connected as ${mqttClient.options.clientId}`,
+      )
+
+      /*
+       * Re-subscribe every time MQTT reconnects.
+       */
+      subscribe()
+    },
+  )
+
+  mqttClient.on(
+    'reconnect',
+    () => {
+      log(
+        'Reconnecting...',
+      )
+    },
+  )
+
+  mqttClient.on(
+    'error',
+    (error) => {
+      log(
+        'Connection error',
+        error,
+      )
+    },
+  )
+
+  mqttClient.on(
+    'offline',
+    () => {
+      log(
+        'Offline',
+      )
+    },
+  )
+
+  mqttClient.on(
+    'close',
+    () => {
+      log(
+        'Connection closed',
+      )
+    },
+  )
+
+  /*
+   |--------------------------------------------------------------------------
+   | MQTT message handler
+   |--------------------------------------------------------------------------
+   */
+
+  mqttClient.on(
+    'message',
+    async (
+      topic,
+      message,
+    ) => {
+      try {
+        const kind =
+          topic.endsWith(
+            '/telemetry',
+          )
+            ? 'telemetry'
+            : topic.endsWith(
+                '/status',
+              )
+              ? 'status'
+              : null
+
+        if (!kind) {
+          return
+        }
+
+        const topicDeviceId =
+          deviceIdFromTopic(
+            topic,
+            kind,
+          )
+
+        if (!topicDeviceId) {
+          log(
+            `Ignoring malformed MQTT topic: ${topic}`,
+          )
+
+          return
+        }
+
+        let payload: unknown
+
+        try {
+          payload =
+            JSON.parse(
+              message.toString(),
+            )
+        } catch (error) {
+          log(
+            `Invalid JSON received on ${topic}`,
+            error,
+          )
+
+          return
+        }
+
+        if (
+          kind ===
+          'telemetry'
+        ) {
+          await telemetry(
+            payload,
+            topicDeviceId,
+          )
+
+          return
+        }
+
+        await status(
+          payload,
+          topicDeviceId,
+        )
+      } catch (error) {
+        log(
+          `Message processing failed for ${topic}`,
+          error,
+        )
+      }
+    },
+  )
+
+  /*
+   |--------------------------------------------------------------------------
+   | mqtt.js can connect before startMqtt() is called.
+   |--------------------------------------------------------------------------
+   */
+
+  if (
+    mqttClient.connected
+  ) {
+    subscribe()
+  }
 }
 
-export function stopMqtt() {
-  mqttClient.removeAllListeners()
-  if (mqttClient.connected || mqttClient.reconnecting) {
-    mqttClient.end(true)
+/*
+|--------------------------------------------------------------------------
+| MQTT shutdown
+|--------------------------------------------------------------------------
+*/
+
+export async function stopMqtt() {
+  if (!started) {
+    return
+  }
+
+  started = false
+
+  mqttClient.removeAllListeners(
+    'connect',
+  )
+
+  mqttClient.removeAllListeners(
+    'reconnect',
+  )
+
+  mqttClient.removeAllListeners(
+    'error',
+  )
+
+  mqttClient.removeAllListeners(
+    'offline',
+  )
+
+  mqttClient.removeAllListeners(
+    'close',
+  )
+
+  mqttClient.removeAllListeners(
+    'message',
+  )
+
+  if (
+    mqttClient.connected ||
+    mqttClient.reconnecting
+  ) {
+    await new Promise<void>(
+      (resolve) => {
+        mqttClient.end(
+          false,
+          {},
+          () => resolve(),
+        )
+      },
+    )
   }
 }

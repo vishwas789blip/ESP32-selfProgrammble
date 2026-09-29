@@ -19,7 +19,9 @@ type RealtimeMessage = {
   [key: string]: unknown
 }
 
-const clients = new Set<Client>()
+const clientsByUser = new Map<string, Set<Client>>()
+const HEARTBEAT_INTERVAL_MS = 30_000
+let heartbeatTimer: NodeJS.Timeout | null = null
 
 export const realtimeWss = new WebSocketServer({
   noServer: true,
@@ -84,6 +86,33 @@ function extractUserId(decoded: unknown): string | null {
   }
 
   return String(id)
+}
+
+function removeClient(client: Client) {
+  const set = clientsByUser.get(client.userId)
+  if (!set) return
+  set.delete(client)
+  if (set.size === 0) clientsByUser.delete(client.userId)
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer) return
+  heartbeatTimer = setInterval(() => {
+    for (const [userId, userClients] of clientsByUser) {
+      for (const client of userClients) {
+        const state = client as Client & { alive?: boolean }
+        if (state.alive === false) {
+          removeClient(client)
+          try { client.socket.terminate() } catch {}
+          continue
+        }
+        state.alive = false
+        try { client.socket.ping() } catch { removeClient(client) }
+      }
+      if (userClients.size === 0) clientsByUser.delete(userId)
+    }
+  }, HEARTBEAT_INTERVAL_MS)
+  heartbeatTimer.unref()
 }
 
 export function setupRealtime(server: Server) {
@@ -157,7 +186,14 @@ export function setupRealtime(server: Server) {
         userId,
       }
 
-      clients.add(client)
+      let userClients = clientsByUser.get(userId)
+      if (!userClients) {
+        userClients = new Set<Client>()
+        clientsByUser.set(userId, userClients)
+      }
+      userClients.add(client)
+      ;(client as Client & { alive?: boolean }).alive = true
+      socket.on('pong', () => { (client as Client & { alive?: boolean }).alive = true })
 
       send(socket, {
         type: 'connection_status',
@@ -173,12 +209,12 @@ export function setupRealtime(server: Server) {
           `[WS] Client disconnected: ${userId} code=${code} reason=${reason.toString()}`,
         )
 
-        clients.delete(client)
+        removeClient(client)
       })
 
       socket.on('error', (error) => {
         console.error(`[WS] Client error: ${userId}`, error)
-        clients.delete(client)
+        removeClient(client)
       })
 
       socket.on('message', (raw) => {
@@ -198,6 +234,7 @@ export function setupRealtime(server: Server) {
     },
   )
 
+  startHeartbeat()
   return realtimeWss
 }
 
@@ -287,17 +324,13 @@ async function sendInitialSnapshot(client: Client) {
   }
 }
 
-function broadcastToUser(
-  userId: string,
-  message: RealtimeMessage,
-) {
-  for (const client of clients) {
-    if (
-      client.userId === userId &&
-      client.socket.readyState === WebSocket.OPEN
-    ) {
-      send(client.socket, message)
-    }
+function broadcastToUser(userId: string, message: RealtimeMessage) {
+  const userClients = clientsByUser.get(userId)
+  if (!userClients) return
+
+  for (const client of userClients) {
+    if (client.socket.readyState === WebSocket.OPEN) send(client.socket, message)
+    else removeClient(client)
   }
 }
 

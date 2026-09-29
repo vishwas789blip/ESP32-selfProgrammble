@@ -5,6 +5,7 @@ import { Sensor } from '../models/Sensor.js'
 import { Actuator } from '../models/Actuator.js'
 import { createEvent } from './eventService.js'
 import { topics } from '../config/mqtt.js'
+import { env } from '../config/env.js'
 import { publishMessage } from './mqttPublisher.js'
 import { broadcastActuatorUpdate } from './realtimeService.js'
 import { evaluateCondition, valueThatSatisfies, NO_PREVIOUS } from './automationLogic.js'
@@ -160,6 +161,8 @@ export async function evaluateAutomations(
   currentValue: unknown,
   previousValue: unknown,
 ) {
+  if (env.AUTOMATION_EXECUTOR !== 'server') return
+
   if (!Types.ObjectId.isValid(sensorId)) {
     console.warn(`[AUTOMATION] Invalid sensor ID: ${sensorId}`)
     return
@@ -229,10 +232,14 @@ export async function evaluateAutomations(
         throw error
       }
 
-      // Nothing reached the device (broker down, actuator deleted, ...): re-arm the
-      // latch so the rule can retry on the next telemetry packet instead of staying
-      // silently "already triggered".
-      if (outcome.failed.length > 0 || outcome.published.length === 0) {
+      // Never re-arm after a partial execution: successful actions have already
+      // happened and blindly retrying the whole rule would duplicate them. A failed
+      // execution is surfaced through logs/events and the next false -> true edge
+      // will execute it again.
+      if (outcome.failed.length > 0) {
+        console.error(`[AUTOMATION] ${automation.name}: ${outcome.failed.length} action(s) failed; latch remains claimed to prevent duplicates`)
+      }
+      if (outcome.published.length === 0) {
         await releaseLatch(automation._id)
       }
     } catch (error) {
