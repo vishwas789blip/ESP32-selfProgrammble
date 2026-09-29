@@ -443,8 +443,7 @@ export async function commandActuator(
     device.deviceId,
     {
       type: 'actuator',
-      actuatorId:
-        actuator.name,
+      actuatorId: String(actuator._id),
       command: normalized,
       ...(value !== undefined ? { value } : {}),
       ...(duration ? { duration } : {}),
