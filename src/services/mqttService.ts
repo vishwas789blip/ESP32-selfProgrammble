@@ -774,7 +774,18 @@ async function telemetry(raw: unknown, topicDeviceId: string) {
     sensor.value = newValue
     sensor.lastUpdated = now
     sensor.status = deriveSensorStatus(newValue)
-    sensor.healthStatus = 'healthy'
+
+    // A bare analog input cannot prove that a physical sensor is connected.
+    // Floating ADC pins can legitimately produce changing values (e.g. an
+    // unplugged LDR on GPIO 32). Keep the reading for diagnostics, but do not
+    // advertise it as a healthy/verified sensor reading. Digital and other
+    // protocol-backed sensors can be marked healthy when telemetry arrives.
+    const isAnalogSensor =
+      sensor.type === 'light' ||
+      sensor.type === 'analog' ||
+      sensor.interface === 'adc'
+
+    sensor.healthStatus = isAnalogSensor ? 'unverified' : 'healthy'
 
     await sensor.save()
 

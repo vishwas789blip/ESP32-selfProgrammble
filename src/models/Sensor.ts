@@ -20,7 +20,7 @@ const sensorSchema = new Schema({
   // Transport/data freshness is separate from the value status above.
   // 'healthy' means telemetry for this sensor was received recently;
   // 'stale' means the device is alive but this sensor stopped reporting.
-  healthStatus: { type: String, enum: ['healthy', 'stale', 'unknown', 'invalid'], default: 'unknown' },
+  healthStatus: { type: String, enum: ['healthy', 'stale', 'unknown', 'invalid', 'unverified'], default: 'unknown' },
   lastUpdated: Date,
 }, { timestamps: true })
 

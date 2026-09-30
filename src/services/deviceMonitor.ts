@@ -53,7 +53,7 @@ export async function markStaleDevicesOffline(now: Date = new Date()): Promise<n
   // still publish telemetry while one configured sensor stops reporting.
   const sensorStaleCutoff = cutoff
   const staleSensors = await Sensor.find({
-    healthStatus: 'healthy',
+    healthStatus: { $in: ['healthy'] },
     lastUpdated: { $lt: sensorStaleCutoff },
   }).select('_id deviceId name lastUpdated')
 
