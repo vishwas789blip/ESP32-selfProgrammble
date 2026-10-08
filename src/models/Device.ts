@@ -8,7 +8,7 @@ const deviceSchema = new Schema(
     // packets contain only the deviceId, not the application userId.
     // The firmware DEVICE_ID, this field, the MQTT topic (devices/<deviceId>/...)
     // and the backend lookup must all be the exact same string.
-    deviceId: { type: String, required: true, trim: true, index: true },
+    deviceId: { type: String, required: true, trim: true, unique: true },
     description: { type: String, trim: true },
     status: { type: String, enum: ['online', 'offline'], default: 'offline' },
     connectionType: { type: String, enum: ['wifi', 'bluetooth', 'mqtt'], required: true },
@@ -18,6 +18,10 @@ const deviceSchema = new Schema(
     lastSeen: Date,
     config: { type: Schema.Types.Mixed, default: {} },
     metadata: { type: Schema.Types.Mixed, default: {} },
+
+    // ---- Multi-tenant Device Claiming / Pairing Token ----------------------
+    claimToken: { type: String, trim: true },
+    isClaimed: { type: Boolean, default: true },
 
     // ---- Config synchronisation (backend -> ESP32 -> CONFIG_ACK) ----------
     // Monotonic version, bumped only when the generated config content changes.
@@ -32,13 +36,18 @@ const deviceSchema = new Schema(
     lastConfigAckVersion: { type: Number, default: 0 },
     lastConfigAckAt: Date,
     lastConfigError: String,
+
+    // ---- OTA Firmware Update tracking --------------------------------------
+    otaStatus: {
+      type: String,
+      enum: ['idle', 'deploying', 'flashing', 'success', 'failed'],
+      default: 'idle',
+    },
+    targetFirmwareVersion: { type: String },
+    lastOtaAt: Date,
   },
   { timestamps: true },
 )
-
-// Do not scope uniqueness by user: MQTT messages cannot safely be resolved to a
-// user when two users have the same deviceId.
-deviceSchema.index({ deviceId: 1 }, { unique: true })
 
 deviceSchema.index({ userId: 1, createdAt: -1 })
 

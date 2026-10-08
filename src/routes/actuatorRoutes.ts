@@ -24,7 +24,7 @@ const commandSchema = z.object({
 })
 
 export const actuatorRoutes = Router()
-actuatorRoutes.use(authMiddleware)
+actuatorRoutes.use(['/devices', '/actuators'], authMiddleware)
 actuatorRoutes.get('/devices/:deviceId/actuators', asyncHandler(actuatorController.list))
 actuatorRoutes.post('/devices/:deviceId/actuators', validate(actuatorSchema), asyncHandler(actuatorController.create))
 actuatorRoutes.put('/actuators/:id', validate(actuatorSchema.partial()), asyncHandler(actuatorController.update))

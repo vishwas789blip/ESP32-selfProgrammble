@@ -16,9 +16,8 @@ const sensorSchema = z.object({
   unit: z.string().trim().max(50).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
 })
-
 export const sensorRoutes = Router()
-sensorRoutes.use(authMiddleware)
+sensorRoutes.use(['/devices', '/sensors'], authMiddleware)
 sensorRoutes.get('/devices/:deviceId/sensors', asyncHandler(sensorController.list))
 sensorRoutes.post('/devices/:deviceId/sensors', validate(sensorSchema), asyncHandler(sensorController.create))
 sensorRoutes.get('/sensors/:id', asyncHandler(sensorController.get))

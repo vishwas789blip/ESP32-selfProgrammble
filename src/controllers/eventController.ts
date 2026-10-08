@@ -1,9 +1,10 @@
-import type { AuthRequest } from '../types/index.js';
-import { listEvents } from '../services/eventService.js';
-import { getUserId, send } from './common.js';
+import type { Response } from 'express'
+import type { AuthRequest } from '../types/index.js'
+import { listEvents } from '../services/eventService.js'
+import { getUserId, send } from './common.js'
 
 export const eventController = {
-  list: async (req: AuthRequest, res: any) =>
+  list: async (req: AuthRequest, res: Response) =>
     send(res, await listEvents(getUserId(req), {
       deviceId: typeof req.query.deviceId === 'string'
         ? req.query.deviceId
@@ -13,4 +14,4 @@ export const eventController = {
         : undefined,
       limit: Number(req.query.limit) || 50,
     })),
-};
+}

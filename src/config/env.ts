@@ -8,6 +8,7 @@ const schema = z.object({
   JWT_SECRET: z.string().min(32),
   JWT_EXPIRES_IN: z.string().default('7d'),
   CLIENT_URL: z.string().min(1).default('http://localhost:3000'),
+  PUBLIC_URL: z.string().url().optional(),
   MQTT_BROKER_URL: z.string().url().default('mqtt://127.0.0.1:1883'),
   MQTT_USERNAME: z.string().default(''),
   MQTT_PASSWORD: z.string().default(''),
@@ -33,7 +34,7 @@ const schema = z.object({
   DEVICE_OFFLINE_TIMEOUT_SEC: z.coerce.number().int().min(0).default(120),
 
   GEMINI_API_KEY: z.string().min(1),
-  GEMINI_MODEL: z.string().default('gemini-3.6-flash'),
+  GEMINI_MODEL: z.string().default('gemini-1.5-flash'),
 })
 export const env = schema.parse(process.env)
 

@@ -1,48 +1,49 @@
-import type { AuthRequest } from '../types/index.js';
-import { Actuator } from '../models/Actuator.js';
-import * as resourceServices from '../services/resourceServices.js';
-import { getParam, getUserId, send } from './common.js';
+import type { Response } from 'express'
+import type { AuthRequest } from '../types/index.js'
+import { Actuator } from '../models/Actuator.js'
+import * as resourceServices from '../services/resourceServices.js'
+import { getParam, getUserId, send } from './common.js'
 
 export const actuatorController = {
-  list: async (req: AuthRequest, res: any) =>
+  list: async (req: AuthRequest, res: Response) =>
     send(res, await resourceServices.listActuators(
       getUserId(req),
       getParam(req.params.deviceId),
     )),
 
-  create: async (req: AuthRequest, res: any) =>
+  create: async (req: AuthRequest, res: Response) =>
     send(res, await resourceServices.createActuator(
       getUserId(req),
       getParam(req.params.deviceId),
       req.body,
     )),
 
-  update: async (req: AuthRequest, res: any) =>
+  update: async (req: AuthRequest, res: Response) =>
     send(res, await resourceServices.updateActuator(
       getUserId(req),
       getParam(req.params.id),
       req.body,
     )),
 
-  remove: async (req: AuthRequest, res: any) => {
+  remove: async (req: AuthRequest, res: Response) => {
     const item = await resourceServices.ownedResource(
       Actuator,
       getUserId(req),
       getParam(req.params.id),
-    );
+    )
 
-    const deviceId = String(item.deviceId);
-    const itemId = String(item._id);
-    await item.deleteOne();
+    const deviceId = String(item.deviceId)
+    const itemId = String(item._id)
+    await item.deleteOne()
 
     // Automations that referenced this actuator are now incomplete: disable them.
-    await resourceServices.disableAutomationsReferencing({ actuatorId: itemId });
+    await resourceServices.disableAutomationsReferencing({ actuatorId: itemId })
 
-    await resourceServices.pushDeviceConfig(deviceId);
-    send(res, null);
+    await resourceServices.pushDeviceConfig(deviceId)
+    send(res, null)
   },
 
-  command: async (req: AuthRequest, res: any) =>
+  command: async (req: AuthRequest, res: Response) =>
     send(res, await resourceServices.commandActuator(
       getUserId(req),
       getParam(req.params.id),
@@ -51,4 +52,4 @@ export const actuatorController = {
       req.body.value,
       req.body.parameters,
     )),
-};
+}

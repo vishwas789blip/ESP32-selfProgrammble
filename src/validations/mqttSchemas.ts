@@ -36,9 +36,12 @@ export const telemetrySchema = z.object({
   gpioReadings: z.record(z.string(), readingValue).optional(),
 
   // Actuator state acknowledgement: actuator name/id -> on/off/other state.
-  actuatorStates: z.record(z.string(), z.union([
-    z.string(), z.number().finite(), z.boolean(), z.null(),
-  ])).optional(),
+  actuatorStates: z
+    .record(
+      z.string(),
+      z.union([z.string(), z.number().finite(), z.boolean(), z.null()]),
+    )
+    .optional(),
 
   // Generic device metadata from firmware.
   metadata: z.record(z.string(), z.unknown()).optional(),
@@ -57,6 +60,8 @@ export const statusSchema = z.object({
   deviceId: z.string().min(1),
   status: z.enum(['online', 'offline']),
   firmwareVersion: z.string().max(100).optional(),
+  otaStatus: z.string().max(50).optional(),
+  otaProgress: z.number().optional(),
   ipAddress: z.string().max(64).optional(),
   macAddress: z.string().max(100).optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
@@ -68,15 +73,39 @@ export const statusSchema = z.object({
  * value/parameters allow servo angle, PWM, RGB, motor speed, display text,
  * valve position, etc. without a backend schema change.
  */
-export const commandSchema = z.object({
+export const actuatorCommandSchema = z.object({
   type: z.literal('actuator'),
   actuatorId: z.string().min(1),
   command: z.string().trim().min(1).max(100),
-  value: z.union([z.boolean(), z.number().finite(), z.string(), z.null(), z.array(z.unknown()), z.record(z.string(), z.unknown())]).optional(),
+  value: z
+    .union([
+      z.boolean(),
+      z.number().finite(),
+      z.string(),
+      z.null(),
+      z.array(z.unknown()),
+      z.record(z.string(), z.unknown()),
+    ])
+    .optional(),
   duration: z.number().int().positive().max(86400).optional(),
   parameters: z.record(z.string(), z.unknown()).optional(),
   timestamp,
 })
+
+export const otaCommandSchema = z.object({
+  type: z.literal('ota'),
+  command: z.string().trim().min(1).max(100),
+  version: z.string().trim().min(1).max(100),
+  url: z.string().optional(),
+  checksum: z.string().optional(),
+  parameters: z.record(z.string(), z.unknown()).optional(),
+  timestamp,
+})
+
+export const commandSchema = z.discriminatedUnion('type', [
+  actuatorCommandSchema,
+  otaCommandSchema,
+])
 
 const configuredSensor = z.object({
   sensorId: z.string().min(1),
@@ -108,31 +137,46 @@ const configuredAutomation = z.object({
   automationId: z.string(),
   name: z.string(),
   enabled: z.boolean(),
-  conditions: z.array(z.object({
-    sensorId: z.string(),
-    operator: z.string(),
-    value: z.unknown(),
-  })),
-  actions: z.array(z.object({
-    actuatorId: z.string(),
-    command: z.string(),
-    value: z.union([z.boolean(), z.number().finite(), z.string(), z.null(), z.array(z.unknown()), z.record(z.string(), z.unknown())]).optional(),
-    duration: z.number().int().positive().max(86400).optional(),
-    parameters: z.record(z.string(), z.unknown()).optional(),
-  })),
+  conditions: z.array(
+    z.object({
+      sensorId: z.string(),
+      operator: z.string(),
+      value: z.unknown(),
+    }),
+  ),
+  actions: z.array(
+    z.object({
+      actuatorId: z.string(),
+      command: z.string(),
+      value: z
+        .union([
+          z.boolean(),
+          z.number().finite(),
+          z.string(),
+          z.null(),
+          z.array(z.unknown()),
+          z.record(z.string(), z.unknown()),
+        ])
+        .optional(),
+      duration: z.number().int().positive().max(86400).optional(),
+      parameters: z.record(z.string(), z.unknown()).optional(),
+    }),
+  ),
 })
 
-export const configSchema = z.object({
-  deviceId: z.string().min(1),
-  protocolVersion: z.string().optional(),
-  // Config synchronisation: the ESP32 echoes these back in CONFIG_ACK.
-  configVersion: z.number().int().positive().optional(),
-  configHash: z.string().max(64).optional(),
-  sensors: z.array(configuredSensor),
-  actuators: z.array(configuredActuator),
-  automations: z.array(configuredAutomation).optional(),
-  settings: z.record(z.string(), z.unknown()).optional(),
-}).passthrough()
+export const configSchema = z
+  .object({
+    deviceId: z.string().min(1),
+    protocolVersion: z.string().optional(),
+    // Config synchronisation: the ESP32 echoes these back in CONFIG_ACK.
+    configVersion: z.number().int().positive().optional(),
+    configHash: z.string().max(64).optional(),
+    sensors: z.array(configuredSensor),
+    actuators: z.array(configuredActuator),
+    automations: z.array(configuredAutomation).optional(),
+    settings: z.record(z.string(), z.unknown()).optional(),
+  })
+  .passthrough()
 
 /**
  * Device -> backend acknowledgement on `devices/<deviceId>/config/ack`.

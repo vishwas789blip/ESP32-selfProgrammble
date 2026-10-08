@@ -53,8 +53,20 @@ async function releaseLatch(automationId: Types.ObjectId): Promise<void> {
   )
 }
 
+type AutomationDoc = {
+  _id: Types.ObjectId
+  name: string
+  actions: Array<{
+    actuatorId: Types.ObjectId | string
+    command: string
+    value?: unknown
+    duration?: number | null
+    parameters?: Record<string, unknown>
+  }>
+}
+
 async function executeAutomationActions(
-  automation: any,
+  automation: AutomationDoc,
   device: DeviceInfo,
   sensorId: string,
   currentValue: unknown,

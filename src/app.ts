@@ -10,6 +10,7 @@ import { actuatorRoutes } from './routes/actuatorRoutes.js'
 import { automationRoutes } from './routes/automationRoutes.js'
 import { eventRoutes } from './routes/eventRoutes.js'
 import { aiRoutes } from './routes/aiRoutes.js'
+import { firmwareRoutes } from './routes/firmwareRoutes.js'
 import { errorMiddleware } from './middleware/errorMiddleware.js'
 import { notFoundMiddleware } from './middleware/notFoundMiddleware.js'
 
@@ -58,6 +59,7 @@ app.get('/api/health', (_req, res) => {
 })
 
 app.use('/api/auth', authRoutes)
+app.use('/api/firmware', firmwareRoutes)
 app.use('/api/devices', deviceRoutes)
 app.use('/api', sensorRoutes)
 app.use('/api', actuatorRoutes)

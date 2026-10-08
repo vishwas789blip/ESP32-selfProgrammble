@@ -3,6 +3,7 @@ import { Device } from '../models/Device.js'
 import { Sensor } from '../models/Sensor.js'
 import { Actuator } from '../models/Actuator.js'
 import { Automation } from '../models/Automation.js'
+import { Event } from '../models/Event.js'
 import { createEvent } from './eventService.js'
 import { env } from '../config/env.js'
 import { clearRetained } from './mqttPublisher.js'
@@ -71,6 +72,40 @@ function gpioKeys(data: Record<string, unknown>): number[] {
   return [...new Set(keys)]
 }
 
+function canSharePin(
+  newSensor: Record<string, unknown>,
+  existingSensor: Record<string, unknown>,
+): { allowed: boolean; reason?: string } {
+  const iface1 = String(newSensor.interface || 'gpio').toLowerCase()
+  const iface2 = String(existingSensor.interface || 'gpio').toLowerCase()
+
+  // 1. Both are I2C bus devices: sharing SDA/SCL is allowed unless addresses collide
+  if (iface1 === 'i2c' && iface2 === 'i2c') {
+    const addr1 = newSensor.address !== undefined ? String(newSensor.address).toLowerCase().trim() : ''
+    const addr2 = existingSensor.address !== undefined ? String(existingSensor.address).toLowerCase().trim() : ''
+    if (addr1 && addr2 && addr1 === addr2) {
+      return {
+        allowed: false,
+        reason: `I2C address collision: address ${addr1} is already used by sensor '${existingSensor.name}' on this bus`,
+      }
+    }
+    return { allowed: true }
+  }
+
+  // 2. Both are DHT measurements sharing the same physical 1-wire data pin
+  const isDht1 = /dht|temp|humid/i.test(String(newSensor.type || ''))
+  const isDht2 = /dht|temp|humid/i.test(String(existingSensor.type || ''))
+  if (isDht1 && isDht2) {
+    return { allowed: true }
+  }
+
+  // Dedicated GPIO/ADC sensors cannot share pins
+  return {
+    allowed: false,
+    reason: `GPIO is already dedicated to sensor '${existingSensor.name}'`,
+  }
+}
+
 async function assertGpioConflicts(
   deviceId: string,
   role: GpioRole,
@@ -80,24 +115,41 @@ async function assertGpioConflicts(
   const pins = gpioKeys(data)
   if (pins.length === 0) return
 
-  // Sensors may share a physical data pin (for example temperature + humidity
-  // exposed by one DHT device). Actuators, however, must never share a GPIO
-  // with another resource because two drivers would fight over the same pin.
   const [sensors, actuators] = await Promise.all([
     Sensor.find({ deviceId }),
     Actuator.find({ deviceId }),
   ])
 
-  const resources = role === 'sensor' ? actuators : [...sensors, ...actuators]
-
-  for (const resource of resources) {
-    if (excludeId && String(resource._id) === excludeId) continue
-    const otherPins = gpioKeys(resource.toObject() as Record<string, unknown>)
+  // 1. Actuators require exclusive pins - check conflict against all actuators
+  for (const actuator of actuators) {
+    if (excludeId && String(actuator._id) === excludeId) continue
+    const otherPins = gpioKeys(actuator.toObject() as Record<string, unknown>)
     const conflict = pins.find((pin) => otherPins.includes(pin))
     if (conflict !== undefined) {
       throw invalidGpio(
-        `GPIO ${conflict} is already used by ${role === 'sensor' ? 'actuator' : 'sensor/actuator'} '${resource.name}'`,
+        `GPIO ${conflict} is already allocated to actuator '${actuator.name}'`,
       )
+    }
+  }
+
+  // 2. Check conflicts against sensors (allowing bus sharing where electrically valid)
+  for (const sensor of sensors) {
+    if (excludeId && String(sensor._id) === excludeId) continue
+    const otherPins = gpioKeys(sensor.toObject() as Record<string, unknown>)
+    const conflict = pins.find((pin) => otherPins.includes(pin))
+    if (conflict !== undefined) {
+      if (role === 'actuator') {
+        throw invalidGpio(
+          `GPIO ${conflict} is already allocated to sensor '${sensor.name}'`,
+        )
+      } else {
+        const check = canSharePin(data, sensor.toObject() as Record<string, unknown>)
+        if (!check.allowed) {
+          throw invalidGpio(
+            check.reason || `GPIO ${conflict} is already allocated to sensor '${sensor.name}'`,
+          )
+        }
+      }
     }
   }
 }
@@ -264,7 +316,42 @@ export const devices = {
     Device.create({
       ...input,
       userId: oid(userId),
+      isClaimed: true,
     }),
+
+  claim: async (
+    userId: string,
+    input: { deviceId: string; claimToken: string; name?: string },
+  ) => {
+    const { deviceId, claimToken, name } = input
+    const existing = await Device.findOne({ deviceId })
+    if (!existing) {
+      return Device.create({
+        deviceId,
+        claimToken,
+        name: name || `ESP32 Node (${deviceId})`,
+        connectionType: 'wifi',
+        userId: oid(userId),
+        isClaimed: true,
+      })
+    }
+
+    if (existing.isClaimed && String(existing.userId) !== userId) {
+      if (existing.claimToken !== claimToken) {
+        throw Object.assign(new Error('Invalid claim token or device is already owned by another account'), {
+          statusCode: 403,
+          code: 'DEVICE_CLAIM_FAILED',
+        })
+      }
+    }
+
+    existing.userId = oid(userId)
+    existing.isClaimed = true
+    if (name) existing.name = name
+    await existing.save()
+
+    return existing
+  },
 
   update: async (
     userId: string,
@@ -302,6 +389,7 @@ export const devices = {
       Sensor.deleteMany({ deviceId: id }),
       Actuator.deleteMany({ deviceId: id }),
       Automation.deleteMany({ deviceId: id }),
+      Event.deleteMany({ deviceId: id }),
       Device.findByIdAndDelete(id),
     ])
 

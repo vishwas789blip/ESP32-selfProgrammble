@@ -154,6 +154,7 @@ async function callGemini(contents: GeminiContent[], systemPrompt: string) {
       system_instruction: { parts: [{ text: systemPrompt }] },
       tools: [{ function_declarations: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })) }],
     }),
+    signal: AbortSignal.timeout(8000),
   })
 
   if (!response.ok) {
@@ -201,6 +202,121 @@ async function runTool(userId: string, name: string, input: Record<string, unkno
   }
 }
 
+async function localDiagnosticFallback(
+  userId: string,
+  message: string,
+  context: Awaited<ReturnType<typeof buildContext>>,
+): Promise<string> {
+  const lower = message.toLowerCase()
+
+  // Actuator command handling
+  const turnOnMatch = lower.match(/(?:turn\s+on|activate|start|enable)\s+([a-z0-9_-]+)/i)
+  const turnOffMatch = lower.match(/(?:turn\s+off|deactivate|stop|disable)\s+([a-z0-9_-]+)/i)
+
+  if (turnOnMatch || turnOffMatch) {
+    const isTurnOn = Boolean(turnOnMatch)
+    const targetName = (turnOnMatch ? turnOnMatch[1] : turnOffMatch![1]).toLowerCase()
+
+    let matchedActuator: { actuatorId: string; name: string; type: string } | null = null
+    for (const dev of context) {
+      for (const act of dev.actuators) {
+        if (
+          act.name.toLowerCase().includes(targetName) ||
+          act.type.toLowerCase().includes(targetName)
+        ) {
+          matchedActuator = act
+          break
+        }
+      }
+      if (matchedActuator) break
+    }
+
+    if (matchedActuator) {
+      try {
+        const cmd = isTurnOn ? 'ON' : 'OFF'
+        await commandActuator(userId, matchedActuator.actuatorId, cmd)
+        return `✅ **Command Executed:** Successfully sent \`${cmd}\` to actuator **${matchedActuator.name}** (${matchedActuator.type}).`
+      } catch (err) {
+        return `⚠️ **Command Failed:** Attempted to turn ${isTurnOn ? 'ON' : 'OFF'} **${matchedActuator.name}**, but encountered an error: ${(err as Error).message}`
+      }
+    }
+  }
+
+  // Sensor reading query
+  if (
+    lower.includes('temp') ||
+    lower.includes('humid') ||
+    lower.includes('flame') ||
+    lower.includes('sensor') ||
+    lower.includes('reading') ||
+    lower.includes('value') ||
+    lower.includes('distance') ||
+    lower.includes('light')
+  ) {
+    const lines: string[] = ['📊 **Sensor Telemetry & Health Diagnostics:**']
+    for (const dev of context) {
+      lines.push(`\n**Node:** ${dev.name} (\`${dev.hardwareId}\`) — **Status:** ${dev.status.toUpperCase()}`)
+      if (dev.sensors.length === 0) {
+        lines.push('  *(No sensors registered on this node)*')
+      } else {
+        for (const s of dev.sensors) {
+          const valStr = s.value !== undefined && s.value !== null ? `${s.value} ${s.unit || ''}` : 'No reading yet'
+          lines.push(`  • **${s.name}** (${s.type}, GPIO ${s.gpio}): \`${valStr}\` [${s.status}]`)
+        }
+      }
+    }
+    return lines.join('\n')
+  }
+
+  // Actuator status query
+  if (
+    lower.includes('actuator') ||
+    lower.includes('relay') ||
+    lower.includes('buzzer') ||
+    lower.includes('led') ||
+    lower.includes('servo')
+  ) {
+    const lines: string[] = ['⚡ **Actuator Fleet Status:**']
+    for (const dev of context) {
+      lines.push(`\n**Node:** ${dev.name} (\`${dev.hardwareId}\`)`)
+      if (dev.actuators.length === 0) {
+        lines.push('  *(No actuators registered on this node)*')
+      } else {
+        for (const a of dev.actuators) {
+          lines.push(`  • **${a.name}** (${a.type}, GPIO ${a.gpio}): State is **${a.state ? 'ACTIVE / ON' : 'INACTIVE / OFF'}**`)
+        }
+      }
+    }
+    return lines.join('\n')
+  }
+
+  // Default fleet diagnostics summary
+  const lines: string[] = ['🤖 **ESP32 Fleet Diagnostic Summary:**']
+  for (const dev of context) {
+    const lastSeenStr = dev.lastSeen ? new Date(dev.lastSeen).toLocaleTimeString() : 'Never'
+    lines.push(`\n**Node: ${dev.name}** (\`${dev.hardwareId}\`)`)
+    lines.push(`  • Link Status: **${dev.status.toUpperCase()}** (Last Active: ${lastSeenStr})`)
+    lines.push(`  • Sensors (${dev.sensors.length}):`)
+    if (dev.sensors.length === 0) {
+      lines.push('    *(none registered)*')
+    } else {
+      for (const s of dev.sensors) {
+        const valStr = s.value !== undefined && s.value !== null ? `${s.value} ${s.unit || ''}` : 'No reading'
+        lines.push(`    - ${s.name} (${s.type}): ${valStr}`)
+      }
+    }
+    lines.push(`  • Actuators (${dev.actuators.length}):`)
+    if (dev.actuators.length === 0) {
+      lines.push('    *(none registered)*')
+    } else {
+      for (const a of dev.actuators) {
+        lines.push(`    - ${a.name} (${a.type}): ${a.state ? 'ON' : 'OFF'}`)
+      }
+    }
+  }
+  return lines.join('\n')
+}
+
 export async function chat(userId: string, message: string): Promise<string> {
   const context = await buildContext(userId)
 
@@ -219,57 +335,54 @@ export async function chat(userId: string, message: string): Promise<string> {
 
   const contents: GeminiContent[] = [{ role: 'user', parts: [{ text: message }] }]
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const result = await callGemini(contents, systemPrompt)
+  try {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const result = await callGemini(contents, systemPrompt)
 
-    if (result.promptFeedback?.blockReason) {
-      throw serviceUnavailable(`AI provider blocked the request: ${result.promptFeedback.blockReason}`)
+      if (result.promptFeedback?.blockReason) {
+        throw serviceUnavailable(`AI provider blocked the request: ${result.promptFeedback.blockReason}`)
+      }
+
+      const candidate = result.candidates?.[0]
+      const parts = candidate?.content?.parts ?? []
+
+      const functionCalls = parts.filter(isFunctionCallPart)
+      const text = parts.filter(isTextPart).map((p) => p.text).join('\n')
+
+      if (functionCalls.length === 0) {
+        return text || 'Done.'
+      }
+
+      contents.push({ role: 'model', parts })
+
+      const functionResponseParts: GeminiPart[] = await Promise.all(
+        functionCalls.map(async (call) => {
+          try {
+            const data = await runTool(userId, call.functionCall.name, call.functionCall.args ?? {})
+            return {
+              functionResponse: {
+                name: call.functionCall.name,
+                response: { result: data },
+              },
+            }
+          } catch (err) {
+            const e = err as { message?: string }
+            return {
+              functionResponse: {
+                name: call.functionCall.name,
+                response: { error: e.message ?? 'Tool execution failed' },
+              },
+            }
+          }
+        }),
+      )
+
+      contents.push({ role: 'user', parts: functionResponseParts })
     }
 
-    const candidate = result.candidates?.[0]
-    const parts = candidate?.content?.parts ?? []
-
-    const functionCalls = parts.filter(isFunctionCallPart)
-    const text = parts.filter(isTextPart).map((p) => p.text).join('\n')
-
-    if (functionCalls.length === 0) {
-      // No tool call this round — this IS the model's final answer.
-      return text || 'Done.'
-    }
-
-    // Keep the model's own turn (including its functionCall parts) in
-    // history, exactly as Gemini returned it, so the next round has
-    // the full back-and-forth to reason over.
-    contents.push({ role: 'model', parts })
-
-    const functionResponseParts: GeminiPart[] = await Promise.all(
-      functionCalls.map(async (call) => {
-        try {
-          const data = await runTool(userId, call.functionCall.name, call.functionCall.args ?? {})
-          return {
-            functionResponse: {
-              name: call.functionCall.name,
-              response: { result: data },
-            },
-          }
-        } catch (err) {
-          const e = err as { message?: string }
-          return {
-            functionResponse: {
-              name: call.functionCall.name,
-              response: { error: e.message ?? 'Tool execution failed' },
-            },
-          }
-        }
-      }),
-    )
-
-    // Gemini expects function results back as a "user" turn made up of
-    // functionResponse parts (not a "function" role) — this is what
-    // actually drives the model to keep going and produce a final
-    // natural-language reply on the next round.
-    contents.push({ role: 'user', parts: functionResponseParts })
+    return "I wasn't able to finish that within the allotted number of steps — could you narrow the request down?"
+  } catch (err) {
+    console.warn(`[AI Assistant] Gemini request unfulfilled (${(err as Error).message}), using diagnostic engine fallback`)
+    return localDiagnosticFallback(userId, message, context)
   }
-
-  return "I wasn't able to finish that within the allotted number of steps — could you narrow the request down?"
 }

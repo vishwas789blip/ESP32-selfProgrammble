@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { authMiddleware } from '../middleware/authMiddleware.js'
 import { validate } from '../middleware/validateMiddleware.js'
-import { deviceSchema, deviceUpdateSchema, deviceConfigSchema } from '../validations/deviceSchemas.js'
+import { deviceSchema, deviceUpdateSchema, deviceConfigSchema, deviceClaimSchema } from '../validations/deviceSchemas.js'
 import { deviceController } from '../controllers/index.js'
 import { asyncHandler } from '../utils/asyncHandler.js'
 
@@ -11,6 +11,7 @@ deviceRoutes.use(authMiddleware)
 
 deviceRoutes.get('/', asyncHandler(deviceController.list))
 deviceRoutes.post('/', validate(deviceSchema), asyncHandler(deviceController.create))
+deviceRoutes.post('/claim', validate(deviceClaimSchema), asyncHandler(deviceController.claim))
 deviceRoutes.get('/:id', asyncHandler(deviceController.get))
 deviceRoutes.put('/:id', validate(deviceUpdateSchema), asyncHandler(deviceController.update))
 deviceRoutes.delete('/:id', asyncHandler(deviceController.remove))

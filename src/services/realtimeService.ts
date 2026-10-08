@@ -99,16 +99,24 @@ function startHeartbeat() {
   if (heartbeatTimer) return
   heartbeatTimer = setInterval(() => {
     for (const [userId, userClients] of clientsByUser) {
+      const dead: Client[] = []
+
       for (const client of userClients) {
         const state = client as Client & { alive?: boolean }
         if (state.alive === false) {
-          removeClient(client)
-          try { client.socket.terminate() } catch {}
+          dead.push(client)
           continue
         }
         state.alive = false
-        try { client.socket.ping() } catch { removeClient(client) }
+        try { client.socket.ping() } catch { dead.push(client) }
       }
+
+      // Remove dead clients after finishing iteration over the set.
+      for (const client of dead) {
+        removeClient(client)
+        try { client.socket.terminate() } catch {}
+      }
+
       if (userClients.size === 0) clientsByUser.delete(userId)
     }
   }, HEARTBEAT_INTERVAL_MS)
@@ -131,10 +139,10 @@ export function setupRealtime(server: Server) {
 
     console.log('[WS] Token received')
 
-    let decoded: unknown
+    let userId: string
 
     try {
-      decoded = verifyToken(token)
+      userId = verifyToken(token)
     } catch (error) {
       console.error('[WS] JWT verification failed:', error)
 
@@ -142,15 +150,8 @@ export function setupRealtime(server: Server) {
       return
     }
 
-    const userId =
-      typeof decoded === 'string'
-        ? decoded
-        : extractUserId(decoded)
-
     if (!userId) {
       console.error('[WS] JWT does not contain a user id')
-      console.error('[WS] Decoded token:', decoded)
-
       rejectUpgrade(socket, 401, 'Invalid token payload')
       return
     }

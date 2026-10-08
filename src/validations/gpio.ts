@@ -87,7 +87,11 @@ export function collectGpioIssues(
   if (data.pins) {
     for (const [label, pin] of Object.entries(data.pins)) {
       const problem = gpioProblem(pin, role)
-      if (problem) issues.push({ message: `pins.${label}: ${problem}`, path: ['pins', label] })
+      if (problem)
+        issues.push({
+          message: `pins.${label}: ${problem}`,
+          path: ['pins', label],
+        })
     }
   }
 

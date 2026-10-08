@@ -8,9 +8,9 @@ import { startDeviceMonitor, stopDeviceMonitor } from './services/deviceMonitor.
 async function main() {
   await connectDatabase()
 
-  const server = app.listen(env.PORT, () => {
-    console.log(`Server started on port ${env.PORT}`)
-    console.log(`WebSocket endpoint: ws://localhost:${env.PORT}/?token=<JWT>`)
+  const server = app.listen(env.PORT, '0.0.0.0', () => {
+    console.log(`Server started on port ${env.PORT} (0.0.0.0)`)
+    console.log(`WebSocket endpoint: ws://0.0.0.0:${env.PORT}/?token=<JWT>`)
   })
 
   setupRealtime(server)

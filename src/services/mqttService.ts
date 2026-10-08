@@ -27,7 +27,7 @@ import {
   broadcastSensorUpdate,
   broadcastActuatorUpdate,
 } from './realtimeService.js'
-import { publishMessage } from './mqttPublisher.js'
+import { publishMessage, clearRetained } from './mqttPublisher.js'
 
 /* -------------------------------------------------------------------------- */
 /* Logging                                                                    */
@@ -129,6 +129,10 @@ async function logUnknownDevice(
     hint = await unknownDeviceHint(topicDeviceId)
   } catch (error) {
     hint = `could not query MongoDB (${error instanceof Error ? error.message : String(error)})`
+  }
+
+  if (topicDeviceId.startsWith('e2e-')) {
+    clearRetained(`devices/${topicDeviceId}/${kind}`).catch(() => {})
   }
 
   log(
@@ -731,6 +735,8 @@ async function telemetry(raw: unknown, topicDeviceId: string) {
 
   const sensors = await Sensor.find({ deviceId: device._id })
   const now = new Date()
+  const bulkOps: any[] = []
+  const updatedSensors: any[] = []
 
   // Process every registered sensor.
   for (const sensor of sensors) {
@@ -787,9 +793,20 @@ async function telemetry(raw: unknown, topicDeviceId: string) {
 
     sensor.healthStatus = isAnalogSensor ? 'unverified' : 'healthy'
 
-    await sensor.save()
-
-    broadcastSensorUpdate(String(device.userId), sensor.toObject())
+    bulkOps.push({
+      updateOne: {
+        filter: { _id: sensor._id },
+        update: {
+          $set: {
+            value: newValue,
+            lastUpdated: now,
+            status: sensor.status,
+            healthStatus: sensor.healthStatus,
+          },
+        },
+      },
+    })
+    updatedSensors.push(sensor.toObject())
 
     // Server-side automation. If executor=device, the backend must NOT evaluate.
     if (env.AUTOMATION_EXECUTOR === 'server') {
@@ -803,6 +820,14 @@ async function telemetry(raw: unknown, topicDeviceId: string) {
         newValue,
         previousValue,
       )
+    }
+  }
+
+  // Execute all sensor updates in ONE single batch write operation instead of N individual roundtrips
+  if (bulkOps.length > 0) {
+    await Sensor.bulkWrite(bulkOps, { ordered: false })
+    for (const s of updatedSensors) {
+      broadcastSensorUpdate(String(device.userId), s)
     }
   }
 
@@ -891,8 +916,14 @@ async function status(raw: unknown, topicDeviceId: string) {
         status: result.data.status,
         lastSeen: now,
         ...(result.data.firmwareVersion
-          ? { firmwareVersion: result.data.firmwareVersion }
+          ? {
+              firmwareVersion: result.data.firmwareVersion,
+              ...((device.targetFirmwareVersion && result.data.firmwareVersion === device.targetFirmwareVersion) || device.otaStatus === 'deploying'
+                ? { otaStatus: 'idle' }
+                : {}),
+            }
           : {}),
+        ...(result.data.otaStatus ? { otaStatus: result.data.otaStatus } : {}),
         ...(result.data.ipAddress ? { ipAddress: result.data.ipAddress } : {}),
         ...(result.data.macAddress
           ? { macAddress: result.data.macAddress }
