@@ -143,11 +143,14 @@ async function callGemini(contents: GeminiContent[], systemPrompt: string) {
     throw serviceUnavailable('AI assistant is not configured: set GEMINI_API_KEY on the backend.')
   }
 
-  const response = await fetch(GEMINI_URL(env.GEMINI_MODEL), {
+  const cleanKey = env.GEMINI_API_KEY.trim().replace(/^['"]|['"]$/g, '')
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${env.GEMINI_MODEL}:generateContent?key=${encodeURIComponent(cleanKey)}`
+
+  const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-goog-api-key': env.GEMINI_API_KEY,
+      'x-goog-api-key': cleanKey,
     },
     body: JSON.stringify({
       contents,
@@ -159,6 +162,11 @@ async function callGemini(contents: GeminiContent[], systemPrompt: string) {
 
   if (!response.ok) {
     const detail = await response.text().catch(() => '')
+    if (response.status === 401) {
+      throw serviceUnavailable(
+        'Invalid or unpermitted Gemini API key (401). Ensure GEMINI_API_KEY in Render is generated from Google AI Studio (https://aistudio.google.com/app/apikey) and Generative Language API is enabled.',
+      )
+    }
     throw serviceUnavailable(`AI provider request failed (${response.status}): ${detail.slice(0, 300)}`)
   }
 

@@ -34,7 +34,7 @@ const schema = z.object({
   DEVICE_OFFLINE_TIMEOUT_SEC: z.coerce.number().int().min(0).default(120),
 
   GEMINI_API_KEY: z.string().min(1),
-  GEMINI_MODEL: z.string().default('gemini-1.5-flash'),
+  GEMINI_MODEL: z.string().default('gemini-flash-latest'),
 })
 export const env = schema.parse(process.env)
 
